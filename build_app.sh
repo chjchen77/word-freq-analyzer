@@ -10,7 +10,7 @@
 #   ./build_app.sh
 #
 # 前置条件：
-#   pip install pyinstaller jieba pandas openpyxl xlrd
+#   pip install pyinstaller jieba pandas openpyxl xlrd openai
 # ============================================================
 
 set -e
@@ -30,7 +30,7 @@ fi
 
 # 检查依赖
 echo "检查依赖..."
-pip install -q jieba pandas openpyxl xlrd
+pip install -q -r requirements.txt pyinstaller
 
 # 清理旧构建
 rm -rf build dist
@@ -38,14 +38,16 @@ rm -f *.spec 2>/dev/null || true
 
 echo "开始打包..."
 
-# 打包为单文件可执行程序（含窗口模式）
+# 打包为目录包（onedir）：启动时无需解压，速度远快于 onefile
 pyinstaller \
-    --onefile \
+    --onedir \
     --windowed \
     --name "词频统计分析工具" \
+    --hidden-import llm_sentence_analyzer \
     --hidden-import jieba \
     --hidden-import openpyxl \
     --hidden-import xlrd \
+    --hidden-import openai \
     --hidden-import jieba.finalseg \
     --hidden-import jieba.posseg \
     --hidden-import jieba.analyse \

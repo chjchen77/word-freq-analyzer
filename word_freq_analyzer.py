@@ -32,15 +32,15 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 from collections import Counter, defaultdict
 from pathlib import Path
 
-import jieba
 import pandas as pd
+# jieba 延迟导入：仅在实际使用分词时加载，避免启动时耗时
 
 # ============================================================
 # 常量
 # ============================================================
 
-# v3.0: 加入 .xls 支持（需要 xlrd 库）
-SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+# v3.1: 加入 .txt 支持（年报纯文本，文件名格式：代码_年份_公司名_标题_日期.txt）
+SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".txt"}
 
 MAX_EXCEL_ROWS = 1_048_575  # Excel 行上限（减去表头）
 MAX_SENTENCES = 200_000
@@ -231,9 +231,44 @@ def collect_data_files(folders: list[str]) -> tuple[list[str], dict[str, int], l
     return files, dir_counts, errors
 
 
+def _parse_txt_filename(filepath: str) -> tuple[str, str]:
+    """从 txt 文件名中解析公司代码和年份。
+    支持格式：000001_2022_公司名_标题_日期.txt
+    """
+    path = Path(filepath)
+    stem = path.stem
+    code = ""
+    year = ""
+    code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", stem)
+    if code_match:
+        code = code_match.group(1)
+    else:
+        parts = [p for p in re.split(r"[_\-\s]+", stem) if p]
+        if parts:
+            code = parts[0]
+    year_match = re.search(r"((?:19|20)\d{2})", stem)
+    if year_match:
+        year = year_match.group(1)
+    else:
+        path_year_match = re.search(r"((?:19|20)\d{2})", str(path.parent))
+        if path_year_match:
+            year = path_year_match.group(1)
+    return code, year
+
+
 def read_data_file(filepath: str, nrows=None) -> pd.DataFrame:
-    """读取单个数据文件（.xlsx / .xls / .csv），自动检测编码。"""
+    """读取单个数据文件（.xlsx / .xls / .csv / .txt），自动检测编码。"""
     ext = Path(filepath).suffix.lower()
+    if ext == ".txt":
+        code, year = _parse_txt_filename(filepath)
+        for enc in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5"):
+            try:
+                with open(filepath, encoding=enc) as f:
+                    content = f.read()
+                return pd.DataFrame([{"公司代码": code, "年份": year, "文本内容": content}])
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"无法读取文件（编码不支持）：{filepath}")
     if ext in (".xlsx", ".xls"):
         try:
             return pd.read_excel(filepath, nrows=nrows, dtype=str)
@@ -287,6 +322,8 @@ def _read_columns_fast(filepath: str) -> list[str]:
     CSV 只读第一行。比 pd.read_excel(nrows=0) 快 10-100x。
     """
     ext = Path(filepath).suffix.lower()
+    if ext == ".txt":
+        return ["公司代码", "年份", "文本内容"]
     if ext in (".xlsx", ".xls"):
         # 优先用 openpyxl 快速读取第一行
         if ext == ".xlsx":
@@ -334,6 +371,10 @@ def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
     for f in files:
         try:
             ext = Path(f).suffix.lower()
+            if ext == ".txt":
+                for c in ["公司代码", "年份", "文本内容"]:
+                    col_freq[c] = col_freq.get(c, 0) + 1
+                continue
             fsize = os.path.getsize(f)
             # 跳过巨大 xlsx（同目录的小文件结构相同）
             if ext in (".xlsx", ".xls") and fsize > HEADER_SCAN_SIZE_LIMIT:
@@ -350,12 +391,14 @@ def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
 
 
 def fix_stock_code(code) -> str:
-    """修复股票代码：数字补零至6位，非数字保留原值。"""
+    """修复股票代码：剥离交易所后缀（.SH/.SZ/.BJ 等），数字补零至 6 位。"""
     if pd.isna(code):
         return ""
     s = str(code).strip()
     if not s:
         return ""
+    # 剥离常见交易所后缀，如 600001.SH / 000001.SZ / 430001.BJ / 430001.NQ
+    s = re.sub(r"\.(SH|SZ|BJ|NQ|HK|OQ)$", "", s, flags=re.IGNORECASE)
     try:
         return str(int(float(s))).zfill(6)
     except (ValueError, TypeError):
@@ -392,8 +435,88 @@ def parse_year_column(series: pd.Series) -> pd.Series:
 
 
 def split_sentences(text: str) -> list[str]:
-    parts = re.split(r"[。！？；\n!?]", text)
-    return [s.strip() for s in parts if len(s.strip()) > 2]
+    """切分句子，专门处理年报 PDF 转文字后大量断行的问题。
+
+    策略：
+    1. 统一换行符为 \\n
+    2. 连续空行（>=2 个 \\n）= 真正的段落分隔，替换为句末标点
+    3. 单个 \\n = PDF 排版断行（非句子边界），直接删除，两边文字合并
+    4. 按句末标点 。！？ 切分，不切 ；
+    5. 过滤 < 8 字的碎片
+    """
+    # Step 1: 统一换行符
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Step 2: 连续空行 → 段落边界（视为句末）
+    text = re.sub(r"\n{2,}", "。", text)
+    # Step 3: 剩余单个 \n = 行内断字，直接删除
+    text = text.replace("\n", "")
+    # Step 4: 按句末标点切分
+    parts = re.split(r"[。！？!?]", text)
+    return [s.strip() for s in parts if len(s.strip()) >= 8]
+
+
+def _process_one_file(
+    fpath: str,
+    col_stkcd: str,
+    col_year: str,
+    text_columns: list[str],
+    keywords: list[str],
+    use_regex: bool,
+    all_dict_words: set[str],
+    stopwords,
+    use_stopwords: bool,
+    export_sentences: bool,
+    word_to_cat: dict[str, str],
+    agg_rules: dict[str, str],
+    cancel_event,
+) -> tuple[list, list, str]:
+    """处理单个文件，返回 (chunks, sents, log_msg)，异常会向上抛出。
+    设计为独立函数（非闭包），可安全地在 ThreadPoolExecutor 中并发调用。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return [], [], "已取消"
+
+    fname = os.path.basename(fpath)
+    rel_dir = os.path.basename(os.path.dirname(fpath))
+    display_name = f"{rel_dir}/{fname}" if rel_dir else fname
+
+    ext = Path(fpath).suffix.lower()
+    file_size = os.path.getsize(fpath)
+
+    if ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
+        file_chunks: list = []
+        file_sents: list = []
+        file_rows = file_hits = chunk_num = 0
+        for chunk_df in read_csv_chunked(fpath, CHUNK_ROWS):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            chunk_num += 1
+            result, rows, hits, sents = _process_chunk(
+                chunk_df, col_stkcd, col_year, text_columns,
+                keywords, use_regex, all_dict_words,
+                stopwords, use_stopwords, export_sentences, word_to_cat,
+            )
+            if result is not None:
+                file_chunks.append(result)
+                file_rows += rows
+                file_hits += hits
+                file_sents.extend(sents)
+        if file_chunks:
+            merged = pd.concat(file_chunks, ignore_index=True)
+            merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+            return [merged], file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次"
+        return [], [], f"{display_name}  跳过：无有效数据"
+    else:
+        df = read_data_file(fpath)
+        result, rows, hits, sents = _process_chunk(
+            df, col_stkcd, col_year, text_columns,
+            keywords, use_regex, all_dict_words,
+            stopwords, use_stopwords, export_sentences, word_to_cat,
+        )
+        del df
+        if result is not None:
+            return [result], sents, f"{display_name}  {rows}行 命中{hits}次"
+        return [], [], f"{display_name}  跳过：缺少必需列或无有效数据"
 
 
 def load_stopwords_file(path: str) -> set[str]:
@@ -447,27 +570,35 @@ def _process_chunk(
     raw_rows = len(df)  # v3.0: 在过滤前记录原始行数
     df["_stkcd"] = df[col_stkcd].apply(fix_stock_code)
     df["_year"] = parse_year_column(df[col_year])
+    dropped_years = (df["_year"] == 0).sum()
+    if dropped_years > 0:
+        log(f"  警告：{dropped_years} 行因年份无法解析（值为0）已跳过。")
     df = df[df["_year"] > 0].copy()  # v3.0: .copy() 防止 SettingWithCopyWarning
     if len(df) == 0:
         return None, raw_rows, 0, []
-    text_series = df[available_text].fillna("").astype(str).agg(" ".join, axis=1)
+    text_series = df[available_text].fillna("").astype(str).agg("".join, axis=1)
 
     # 关键词匹配
     if use_regex:
         for kw in keywords:
             df[kw] = text_series.str.count(f"(?i){re.escape(kw)}")
     else:
+        import jieba  # 延迟导入：仅 jieba 模式才加载词典
         sw = stopwords if use_stopwords else None
         dict_set = all_dict_words
 
-        def _jieba_row(text):
-            tokens = jieba.lcut(str(text))
-            if sw:
-                tokens = [t for t in tokens if t not in sw]
-            cnt = Counter(t for t in tokens if t in dict_set)
-            return pd.Series({kw: cnt.get(kw, 0) for kw in keywords})
-
-        kw_df = text_series.apply(_jieba_row)
+        # jieba 模式：列表累积后一次性构建 DataFrame（比 apply(pd.Series) 快 5-10x）
+        rows_list = []
+        for text in text_series:
+            words = jieba.lcut(text)
+            if use_stopwords and stopwords:
+                words = [w for w in words if w not in stopwords]
+            cnt: dict[str, int] = {}
+            for w in words:
+                if w in all_dict_words:
+                    cnt[w] = cnt.get(w, 0) + 1
+            rows_list.append({kw: cnt.get(kw, 0) for kw in keywords})
+        kw_df = pd.DataFrame(rows_list, columns=keywords, index=df.index)
         for kw in keywords:
             df[kw] = kw_df[kw].values
 
@@ -485,10 +616,11 @@ def _process_chunk(
                 for kw in row_kws:
                     if re.search(re.escape(kw), sent, re.IGNORECASE):
                         hit_sents.append({
-                            "公司代码": stkcd, "年份": year,
+                            "公司代码": stkcd,
+                            "年份": year,
                             "命中关键词": kw,
                             "分类": word_to_cat.get(kw, ""),
-                            "命中句子": sent[:500],
+                            "命中句子": sent,
                         })
 
     # 按 公司×年份 聚合（v3.0: 每文件/块立即聚合，大幅节省内存）
@@ -513,6 +645,15 @@ def run_analysis(
     stopwords: set[str] | None = None,
     use_tf: bool = False,
     export_sentences: bool = False,
+    analyze_llm: bool = False,
+    llm_api_key: str = "",
+    llm_model: str = "qwen-plus",
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    llm_max_sentences: int = 500,
+    llm_max_workers: int = 4,
+    llm_max_retries: int = 2,
+    llm_cache_path: str | None = None,
+    analysis_workers: int = 1,
     jieba_userdict: str = "",
     progress_cb=None,
     log_cb=None,
@@ -533,6 +674,10 @@ def run_analysis(
     if not all_dict_words:
         raise ValueError("词典为空，请先添加或导入词典。")
 
+    if analyze_llm and not export_sentences:
+        export_sentences = True
+        log("提示：已自动启用导出命中句子，因为 LLM 句子分析依赖命中句子。")
+
     # v3.0: 跨分类重复关键词警告（同一词在多个分类中只会归入最后一个分类）
     duplicates = dict_mgr.find_duplicates()
     if duplicates:
@@ -540,6 +685,12 @@ def run_analysis(
         log(f"警告：以下关键词在多个分类中重复出现（仅归入最后一个分类）：\n  " + "\n  ".join(dup_items))
         if len(duplicates) > 10:
             log(f"  …共 {len(duplicates)} 个重复词")
+    # 构建词典诊断数据，写入输出文件
+    dup_rows = [{"关键词": w, "所在分类（全部）": "、".join(cats), "实际归入分类": cats[-1], "说明": "同一关键词出现在多个分类，仅计入最后一个分类"}
+                for w, cats in (duplicates or {}).items()]
+    sheet_dict_diag = pd.DataFrame(dup_rows) if dup_rows else pd.DataFrame(
+        columns=["关键词", "所在分类（全部）", "实际归入分类", "说明"]
+    )
 
     # v3.0: 列名碰撞检查 — 关键词/分类名不能与内部列名冲突
     _reserved = {"公司代码", "年份", "总计", "_stkcd", "_year"}
@@ -559,6 +710,7 @@ def run_analysis(
     if use_regex:
         log("匹配模式：正则匹配（不区分大小写）")
     else:
+        import jieba  # 延迟导入：仅 jieba 模式才加载词典
         if jieba_userdict and os.path.isfile(jieba_userdict):
             jieba.load_userdict(jieba_userdict)
             log(f"已加载 jieba 用户词典：{os.path.basename(jieba_userdict)}")
@@ -573,87 +725,81 @@ def run_analysis(
     all_chunks: list[pd.DataFrame] = []
     hit_sentences: list[dict] = []
     total_files = len(files)
-    do_export_sentences = export_sentences
     agg_rules = {kw: "sum" for kw in keywords}
+    _sent_lock = threading.Lock()
+    _sent_capped = threading.Event()  # 并发模式下句子上限信号
 
-    for idx, fpath in enumerate(files, 1):
-        if is_cancelled():
-            log("用户已取消。")
-            break
+    _workers = max(1, int(analysis_workers))
 
-        fname = os.path.basename(fpath)
-        rel_dir = os.path.basename(os.path.dirname(fpath))
-        display_name = f"{rel_dir}/{fname}" if rel_dir else fname
-        log(f"[{idx}/{total_files}] {display_name}")
-
-        try:
-            ext = Path(fpath).suffix.lower()
-            file_size = os.path.getsize(fpath)
-
-            # v3.0: 大 CSV 文件分块读取
-            if ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
-                log(f"  大文件模式（{file_size / 1024 / 1024:.0f}MB），分块处理…")
-                file_chunks = []
-                file_rows = 0
-                file_hits = 0
-                chunk_num = 0
-
-                for chunk_df in read_csv_chunked(fpath, CHUNK_ROWS):
-                    if is_cancelled():
-                        break
-                    chunk_num += 1
-                    result, rows, hits, sents = _process_chunk(
-                        chunk_df, col_stkcd, col_year, text_columns,
-                        keywords, use_regex, all_dict_words,
-                        stopwords, use_stopwords, do_export_sentences,
-                        word_to_cat,
-                    )
-                    if result is not None:
-                        file_chunks.append(result)
-                        file_rows += rows
-                        file_hits += hits
-                        hit_sentences.extend(sents)
-                        if len(hit_sentences) > MAX_SENTENCES:
-                            do_export_sentences = False
-                            log("  命中句子已达上限，后续跳过提取。")
-
-                if file_chunks:
-                    merged = pd.concat(file_chunks, ignore_index=True)
-                    merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
-                    all_chunks.append(merged)
-                    log(f"  {chunk_num} 块，共 {file_rows} 行，命中 {file_hits} 次")
-                else:
-                    log(f"  跳过：无有效数据")
-
-            else:
-                # 正常读取（Excel 或小 CSV）
-                df = read_data_file(fpath)
-                result, rows, hits, sents = _process_chunk(
-                    df, col_stkcd, col_year, text_columns,
+    if _workers == 1:
+        # ── 单线程顺序模式（兼容低配设备，日志顺序清晰）────────────────
+        do_export_sentences = export_sentences
+        for idx, fpath in enumerate(files, 1):
+            if is_cancelled():
+                log("用户已取消。")
+                break
+            fname = os.path.basename(fpath)
+            rel_dir = os.path.basename(os.path.dirname(fpath))
+            display_name = f"{rel_dir}/{fname}" if rel_dir else fname
+            log(f"[{idx}/{total_files}] {display_name}")
+            try:
+                chunks, sents, msg = _process_one_file(
+                    fpath, col_stkcd, col_year, text_columns,
                     keywords, use_regex, all_dict_words,
                     stopwords, use_stopwords, do_export_sentences,
-                    word_to_cat,
+                    word_to_cat, agg_rules, cancel_event,
                 )
-                del df  # 及时释放
+                log(f"  {msg.split('  ', 1)[-1]}" if "  " in msg else f"  {msg}")
+                all_chunks.extend(chunks)
+                hit_sentences.extend(sents)
+                if len(hit_sentences) > MAX_SENTENCES:
+                    do_export_sentences = False
+                    log("  命中句子已达上限，后续跳过提取。")
+            except Exception as e:
+                log(f"  跳过（错误）：{e}")
+            gc.collect()
+            if progress_cb:
+                progress_cb(idx, total_files)
 
-                if result is not None:
-                    all_chunks.append(result)
-                    hit_sentences.extend(sents)
-                    if len(hit_sentences) > MAX_SENTENCES:
-                        do_export_sentences = False
-                        log("  命中句子已达上限，后续跳过提取。")
-                    log(f"  {rows} 行，命中 {hits} 次")
-                else:
-                    log(f"  跳过：缺少必需列或无有效数据")
-
-        except Exception as e:
-            log(f"  跳过（错误）：{e}")
-
-        # v3.0: 每个文件处理完后回收内存
-        gc.collect()
-
-        if progress_cb:
-            progress_cb(idx, total_files)
+    else:
+        # ── 多线程并发模式（高性能设备）────────────────────────────────
+        log(f"并发模式：{_workers} 个线程同时处理文件（注意日志顺序可能与文件顺序不同）")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=_workers) as executor:
+            future_map = {
+                executor.submit(
+                    _process_one_file,
+                    fpath, col_stkcd, col_year, text_columns,
+                    keywords, use_regex, all_dict_words,
+                    stopwords, use_stopwords, export_sentences,
+                    word_to_cat, agg_rules, cancel_event,
+                ): (i + 1, fpath)
+                for i, fpath in enumerate(files)
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                idx, fpath = future_map[future]
+                completed += 1
+                try:
+                    chunks, sents, msg = future.result()
+                    log(f"[{completed}/{total_files}] {msg}")
+                    all_chunks.extend(chunks)
+                    if sents and not _sent_capped.is_set():
+                        with _sent_lock:
+                            if not _sent_capped.is_set():
+                                hit_sentences.extend(sents)
+                                if len(hit_sentences) >= MAX_SENTENCES:
+                                    hit_sentences[:] = hit_sentences[:MAX_SENTENCES]
+                                    _sent_capped.set()
+                                    log("  命中句子已达上限，后续不再提取。")
+                except Exception as e:
+                    log(f"[{completed}/{total_files}] 跳过（错误）：{e}")
+                gc.collect()
+                if progress_cb:
+                    progress_cb(completed, total_files)
+                if is_cancelled():
+                    log("用户已取消。")
+                    break
 
     if is_cancelled():
         raise ValueError("分析已被用户取消。")
@@ -688,7 +834,7 @@ def run_analysis(
     if use_tf:
         total_per_row = sheet1["总计"].replace(0, 1)  # 避免除零
         for cat in categories:
-            sheet1[f"{cat}_TF"] = (sheet1[cat] / total_per_row).round(6)
+            sheet1[f"{cat}_占比"] = (sheet1[cat] / total_per_row).round(6)
 
     # ---- Sheet2: 公司×年份×关键词 明细（v3.0: 向量化 melt）----
     log("正在构建关键词明细…")
@@ -745,17 +891,61 @@ def run_analysis(
         log(f"警告：Sheet2 共 {len(sheet2)} 行，Excel 上限 {MAX_EXCEL_ROWS}，Excel 中已截断。")
         sheet2 = sheet2.head(MAX_EXCEL_ROWS)
 
+    df_sent = None
+    sheet4_rows = 0
+    if hit_sentences:
+        df_sent = pd.DataFrame(hit_sentences)
+        sheet4_rows = len(df_sent)
+
+        if analyze_llm:
+            log("正在准备 LLM 句子分析...")
+            if llm_cache_path is None:
+                llm_cache_path = os.path.splitext(output_path)[0] + "_llm_cache.json"
+            from llm_sentence_analyzer import LLMAnalyzerConfig, apply_llm_sentence_analysis
+            llm_cfg = LLMAnalyzerConfig.from_inputs(
+                api_key=llm_api_key,
+                model=llm_model,
+                base_url=llm_base_url,
+                max_workers=llm_max_workers,
+                max_sentences=llm_max_sentences,
+                max_retries=llm_max_retries,
+                cache_path=llm_cache_path,
+            )
+            log(
+                f"LLM 配置：模型 {llm_cfg.model}，唯一句子上限 {llm_cfg.max_sentences}，"
+                f"缓存文件 {os.path.basename(llm_cfg.cache_path) if llm_cfg.cache_path else '未启用'}"
+            )
+            df_sent = apply_llm_sentence_analysis(
+                df_sent,
+                llm_cfg,
+                log_cb=log,
+                cancel_event=cancel_event,
+            )
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         sheet1.to_excel(writer, sheet_name="公司年份分类统计", index=False)
         sheet2.to_excel(writer, sheet_name="关键词明细", index=False)
         sheet3.to_excel(writer, sheet_name="分类汇总", index=False)
-        if hit_sentences:
-            df_sent = pd.DataFrame(hit_sentences)
-            if len(df_sent) > MAX_SENTENCES:
-                df_sent = df_sent.head(MAX_SENTENCES)
-            if len(df_sent) > MAX_EXCEL_ROWS:
-                df_sent = df_sent.head(MAX_EXCEL_ROWS)
-            df_sent.to_excel(writer, sheet_name="命中句子", index=False)
+        sheet_dict_diag.to_excel(writer, sheet_name="词典诊断", index=False)
+        # 分析说明 sheet
+        explain_rows = [
+            {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
+            {"项目": "Sheet4 命中句子", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，Sheet1计N次，但Sheet4仅记录该句子一次。"},
+            {"项目": "分类占比列（_占比）", "说明": "= 该分类出现次数 / 该行所有分类出现次数之和。这是分类构成比，不是传统TF词频（词频/文档总词数）。"},
+            {"项目": "LLM分析维度", "说明": "LLM时间指向/语态/句子类型/确定性/量化属性/语气均基于关键词所在句子的语义判断，temperature=0确保可复现。"},
+            {"项目": "重复关键词处理", "说明": "同一关键词出现在多个分类时，仅归入词典中最后定义的分类。详见【词典诊断】sheet。"},
+            {"项目": "句子提取规则", "说明": "以。！？为句子边界切分；连续空行视为段落边界；单个换行视为PDF断行删除。最短句子长度=8字。"},
+        ]
+        pd.DataFrame(explain_rows).to_excel(writer, sheet_name="分析说明", index=False)
+        if df_sent is not None:
+            df_sent_out = df_sent
+            if len(df_sent_out) > MAX_SENTENCES:
+                df_sent_out = df_sent_out.head(MAX_SENTENCES)
+            if len(df_sent_out) > MAX_EXCEL_ROWS:
+                df_sent_out = df_sent_out.head(MAX_EXCEL_ROWS)
+            # 加序号列，方便研究者交叉核查原文
+            df_sent_out.insert(0, "序号", range(1, len(df_sent_out) + 1))
+            df_sent_out.to_excel(writer, sheet_name="命中句子", index=False)
 
     n_companies = sheet1["公司代码"].nunique()
     year_min = int(sheet1["年份"].min()) if len(sheet1) > 0 else 0
@@ -765,7 +955,15 @@ def run_analysis(
     log(f"Sheet2: 关键词明细 ({len(sheet2)} 行)")
     log(f"Sheet3: 分类汇总 ({len(sheet3)} 行)")
     if hit_sentences:
-        log(f"Sheet4: 命中句子 ({len(hit_sentences)} 条)")
+        log(f"Sheet4: 命中句子 ({sheet4_rows} 条)")
+    if df_sent is not None and analyze_llm and "LLM分析状态" in df_sent.columns:
+        llm_status = df_sent["LLM分析状态"].value_counts(dropna=False).to_dict()
+        status_text = ", ".join(f"{k}={v}" for k, v in llm_status.items())
+        log(f"LLM 句子分析状态：{status_text}")
+        if "LLM置信度" in df_sent.columns:
+            conf_dist = df_sent[df_sent["LLM分析状态"] == "成功"]["LLM置信度"].value_counts(dropna=False).to_dict()
+            conf_text = ", ".join(f"{k}={v}" for k, v in conf_dist.items())
+            log(f"LLM 置信度分布：{conf_text}")
     log(f"结果已保存至：{output_path}")
 
 
@@ -829,7 +1027,25 @@ class WordFreqApp(tk.Tk):
         self.stopwords_path = tk.StringVar()
         self.var_tf = tk.BooleanVar(value=False)
         self.var_sentences = tk.BooleanVar(value=False)
+        self.analysis_workers_var = tk.StringVar(value="1")
+        self.var_llm = tk.BooleanVar(value=False)
+        self.llm_api_key_var = tk.StringVar(value=os.getenv("DASHSCOPE_API_KEY", ""))
+        self.llm_show_key_var = tk.BooleanVar(value=False)
+        self.llm_model_var = tk.StringVar(value=os.getenv("QWEN_MODEL", "qwen-plus"))
+        self.llm_base_url_var = tk.StringVar(
+            value=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        )
+        self.llm_max_sentences_var = tk.StringVar(value="500")
+        self.llm_max_workers_var = tk.StringVar(value="4")
+        self.llm_max_retries_var = tk.StringVar(value="2")
+        self.llm_cache_custom_var = tk.BooleanVar(value=False)
+        self.llm_cache_path_var = tk.StringVar(value="")
+        self._llm_api_key_entry = None
+        self._llm_cache_entry = None
+        self._llm_cache_btn = None
         self.jieba_dict_path = tk.StringVar()
+        self._word_search_var = tk.StringVar()
+        self._word_search_var.trace_add("write", self._on_word_search)
         self.current_file_var = tk.StringVar(value="就绪")
 
         # v3.0: 取消事件
@@ -888,7 +1104,7 @@ class WordFreqApp(tk.Tk):
         notebook.add(tab, text=" 数据选择 ")
 
         # -- 文件夹 --
-        frm_folder = ttk.LabelFrame(tab, text="文本文件夹（递归扫描所有子目录中的 .xlsx / .xls / .csv 文件）")
+        frm_folder = ttk.LabelFrame(tab, text="文本文件夹（递归扫描所有子目录中的 .xlsx / .xls / .csv / .txt 文件）")
         frm_folder.pack(fill="x", padx=8, pady=(8, 4))
 
         top = ttk.Frame(frm_folder)
@@ -973,56 +1189,103 @@ class WordFreqApp(tk.Tk):
         tab = ttk.Frame(notebook)
         notebook.add(tab, text=" 词典管理 ")
 
+        # ── 顶部工具栏 ──────────────────────────────────────────────
         toolbar = ttk.Frame(tab)
-        toolbar.pack(fill="x", padx=8, pady=(8, 4))
-        ttk.Button(toolbar, text="新建词典", command=self._dict_new).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="导入词典", command=self._dict_import).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="导出词典", command=self._dict_export).pack(side="left", padx=2)
+        toolbar.pack(fill="x", padx=8, pady=(8, 0))
+
+        ttk.Button(toolbar, text="新建词典", command=self._dict_new).pack(side="left", padx=(0, 4))
+        ttk.Button(toolbar, text="导入词典", command=self._dict_import).pack(side="left", padx=(0, 4))
+        ttk.Button(toolbar, text="导出词典", command=self._dict_export).pack(side="left", padx=(0, 4))
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6, pady=3)
+
         self.dict_info_var = tk.StringVar(value="当前词典：0 个分类，0 个关键词")
-        ttk.Label(toolbar, textvariable=self.dict_info_var).pack(side="right", padx=5)
+        ttk.Label(toolbar, textvariable=self.dict_info_var, foreground="#444444").pack(side="left")
 
-        frm_hint = ttk.LabelFrame(tab, text="支持的词典格式")
-        frm_hint.pack(fill="x", padx=8, pady=(0, 4))
-        hint = (
-            "格式1 (Excel .xlsx/.xls)：第一列=分类，第二列=关键词，每行一个词\n"
-            "格式2 (文本 .txt)：每行 分类：词1,词2,词3  例如 → 低碳战略：碳中和,碳达峰,低碳转型"
+        # ── 格式提示（折叠式）───────────────────────────────────────
+        hint_frame = ttk.Frame(tab)
+        hint_frame.pack(fill="x", padx=8, pady=(4, 0))
+        hint_text = (
+            "支持格式：① Excel (.xlsx/.xls)：第一列=分类，第二列=关键词  "
+            "② 文本 (.txt)：每行 分类：词1,词2,词3"
         )
-        ttk.Label(frm_hint, text=hint, wraplength=800, justify="left").pack(
-            anchor="w", padx=5, pady=4
-        )
+        ttk.Label(hint_frame, text=hint_text, foreground="#666666",
+                  font=("", 9)).pack(anchor="w")
 
+        ttk.Separator(tab, orient="horizontal").pack(fill="x", padx=8, pady=(6, 0))
+
+        # ── 主面板（分类 左 + 关键词 右）────────────────────────────
         pane = ttk.Frame(tab)
-        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        pane.pack(fill="both", expand=True, padx=8, pady=6)
         pane.columnconfigure(0, weight=1)
         pane.columnconfigure(1, weight=2)
         pane.rowconfigure(0, weight=1)
 
-        frm_cat = ttk.LabelFrame(pane, text="分类列表")
-        frm_cat.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        # ── 左：分类列表 ─────────────────────────────────────────────
+        frm_cat = ttk.LabelFrame(pane, text="分类")
+        frm_cat.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        frm_cat.rowconfigure(0, weight=1)
+        frm_cat.columnconfigure(0, weight=1)
 
-        self.cat_listbox = tk.Listbox(frm_cat, height=10)
-        self.cat_listbox.pack(fill="both", expand=True, padx=5, pady=(5, 0))
+        cat_container = ttk.Frame(frm_cat)
+        cat_container.grid(row=0, column=0, sticky="nsew", padx=5, pady=(5, 0))
+        cat_container.rowconfigure(0, weight=1)
+        cat_container.columnconfigure(0, weight=1)
+
+        self.cat_listbox = tk.Listbox(cat_container, height=12, activestyle="dotbox",
+                                      selectbackground="#4a90d9", selectforeground="white")
+        cat_vsb = ttk.Scrollbar(cat_container, orient="vertical", command=self.cat_listbox.yview)
+        self.cat_listbox.configure(yscrollcommand=cat_vsb.set)
+        self.cat_listbox.grid(row=0, column=0, sticky="nsew")
+        cat_vsb.grid(row=0, column=1, sticky="ns")
         self.cat_listbox.bind("<<ListboxSelect>>", self._on_cat_select)
 
         cat_btns = ttk.Frame(frm_cat)
-        cat_btns.pack(fill="x", padx=5, pady=5)
-        ttk.Button(cat_btns, text="添加分类", command=self._cat_add).pack(side="left", padx=2)
-        ttk.Button(cat_btns, text="删除分类", command=self._cat_remove).pack(side="left", padx=2)
+        cat_btns.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Button(cat_btns, text="添加", width=6, command=self._cat_add).pack(side="left", padx=(0, 3))
+        ttk.Button(cat_btns, text="重命名", width=7, command=self._cat_rename).pack(side="left", padx=(0, 3))
+        ttk.Button(cat_btns, text="删除", width=6, command=self._cat_remove).pack(side="left")
 
-        frm_words = ttk.LabelFrame(pane, text="关键词列表（选中分类后显示）")
+        # ── 右：关键词列表 ───────────────────────────────────────────
+        frm_words = ttk.LabelFrame(pane, text="关键词")
         frm_words.grid(row=0, column=1, sticky="nsew")
+        frm_words.rowconfigure(1, weight=1)
+        frm_words.columnconfigure(0, weight=1)
 
-        self.word_listbox = tk.Listbox(frm_words, height=10)
-        word_sb = ttk.Scrollbar(frm_words, orient="vertical", command=self.word_listbox.yview)
-        self.word_listbox.configure(yscrollcommand=word_sb.set)
-        self.word_listbox.pack(side="left", fill="both", expand=True, padx=(5, 0), pady=(5, 0))
-        word_sb.pack(side="right", fill="y", padx=(0, 5), pady=(5, 0))
+        # 搜索框
+        search_row = ttk.Frame(frm_words)
+        search_row.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 2))
+        ttk.Label(search_row, text="搜索：").pack(side="left")
+        self._word_search_entry = ttk.Entry(search_row, textvariable=self._word_search_var, width=20)
+        self._word_search_entry.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
+        # 关键词列表（多选）
+        word_container = ttk.Frame(frm_words)
+        word_container.grid(row=1, column=0, sticky="nsew", padx=5, pady=0)
+        word_container.rowconfigure(0, weight=1)
+        word_container.columnconfigure(0, weight=1)
+
+        self.word_listbox = tk.Listbox(word_container, height=10, selectmode="extended",
+                                       activestyle="dotbox",
+                                       selectbackground="#4a90d9", selectforeground="white")
+        word_vsb = ttk.Scrollbar(word_container, orient="vertical", command=self.word_listbox.yview)
+        self.word_listbox.configure(yscrollcommand=word_vsb.set)
+        self.word_listbox.grid(row=0, column=0, sticky="nsew")
+        word_vsb.grid(row=0, column=1, sticky="ns")
+
+        # 关键词操作按钮
         word_btns = ttk.Frame(frm_words)
-        word_btns.pack(fill="x", padx=5, pady=5)
-        ttk.Button(word_btns, text="添加关键词", command=self._word_add).pack(side="left", padx=2)
-        ttk.Button(word_btns, text="批量添加", command=self._word_batch_add).pack(side="left", padx=2)
-        ttk.Button(word_btns, text="删除关键词", command=self._word_remove).pack(side="left", padx=2)
+        word_btns.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+
+        ttk.Button(word_btns, text="添加", width=6,
+                   command=self._word_add).pack(side="left", padx=(0, 3))
+        ttk.Button(word_btns, text="批量添加", width=8,
+                   command=self._word_batch_add).pack(side="left", padx=(0, 3))
+        ttk.Button(word_btns, text="删除所选", width=8,
+                   command=self._word_remove).pack(side="left", padx=(0, 3))
+        ttk.Button(word_btns, text="全选", width=5,
+                   command=lambda: self.word_listbox.select_set(0, tk.END)).pack(side="left", padx=(0, 3))
+        ttk.Button(word_btns, text="清空本类", width=8,
+                   command=self._word_clear_all).pack(side="left")
 
     # ---- 标签页3：分析设置 ----
 
@@ -1031,54 +1294,170 @@ class WordFreqApp(tk.Tk):
         notebook.add(tab, text=" 分析设置 ")
         pad = {"padx": 8, "pady": 4}
 
-        frm_mode = ttk.LabelFrame(tab, text="匹配模式 — 决定如何在文本中查找关键词")
+        # ── 匹配模式 ─────────────────────────────────────────────────
+        frm_mode = ttk.LabelFrame(tab, text="匹配模式")
         frm_mode.pack(fill="x", **pad)
         ttk.Radiobutton(
             frm_mode, variable=self.var_regex, value=True,
-            text="正则匹配（推荐）— 用 re.findall 直接搜索关键词，不区分大小写，适合含英文词的词库"
-        ).pack(anchor="w", padx=5, pady=2)
+            text="正则匹配（推荐）— re.findall 直接搜索，不区分大小写，支持中英文混合词库"
+        ).pack(anchor="w", padx=8, pady=(4, 1))
         ttk.Radiobutton(
             frm_mode, variable=self.var_regex, value=False,
-            text="jieba 分词匹配 — 先用 jieba 将文本切词，再匹配词典，适合纯中文精细分析（较慢）"
-        ).pack(anchor="w", padx=5, pady=(0, 5))
+            text="jieba 分词匹配 — 先切词再匹配，适合纯中文精细分析（速度较慢）"
+        ).pack(anchor="w", padx=8, pady=(1, 6))
 
-        frm_stop = ttk.LabelFrame(tab, text="停用词 — 分词后过滤无意义词语（仅 jieba 模式生效）")
+        # ── 输出选项 ──────────────────────────────────────────────────
+        frm_out_opts = ttk.LabelFrame(tab, text="输出选项")
+        frm_out_opts.pack(fill="x", **pad)
+
+        row_out1 = ttk.Frame(frm_out_opts)
+        row_out1.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Checkbutton(
+            row_out1, variable=self.var_tf,
+            text="计算分类占比  （在 Sheet1 中为每个分类添加占比列 = 该分类次数 / 该行总命中次数）"
+        ).pack(side="left")
+
+        row_out2 = ttk.Frame(frm_out_opts)
+        row_out2.pack(fill="x", padx=8, pady=(2, 4))
+        ttk.Checkbutton(
+            row_out2, variable=self.var_sentences,
+            text="导出命中句子  （提取含关键词的原文句子到 Sheet4，用于论文引用验证，大数据集较慢）"
+        ).pack(side="left")
+
+        # ── 停用词 ───────────────────────────────────────────────────
+        frm_stop = ttk.LabelFrame(tab, text="停用词过滤（仅 jieba 模式生效）")
         frm_stop.pack(fill="x", **pad)
-        ttk.Checkbutton(frm_stop, text="启用停用词过滤（内置 100+ 常用中文停用词）",
-                        variable=self.var_stopwords).pack(anchor="w", padx=5, pady=2)
-        row_sf = ttk.Frame(frm_stop)
-        row_sf.pack(fill="x", padx=5, pady=(0, 5))
-        ttk.Label(row_sf, text="追加自定义停用词文件（每行一个词）：").pack(side="left")
-        ttk.Entry(row_sf, textvariable=self.stopwords_path, width=36,
-                  state="readonly").pack(side="left", padx=5)
-        ttk.Button(row_sf, text="选择", command=self._choose_stopwords).pack(side="left")
+        row_sw1 = ttk.Frame(frm_stop)
+        row_sw1.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Checkbutton(row_sw1, text="启用停用词过滤（内置 100+ 常用中文停用词）",
+                        variable=self.var_stopwords).pack(side="left")
+        row_sw2 = ttk.Frame(frm_stop)
+        row_sw2.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(row_sw2, text="追加停用词文件：").pack(side="left")
+        ttk.Entry(row_sw2, textvariable=self.stopwords_path, width=32,
+                  state="readonly").pack(side="left", padx=(4, 6))
+        ttk.Button(row_sw2, text="选择文件", command=self._choose_stopwords).pack(side="left")
 
-        frm_tf = ttk.LabelFrame(tab, text="输出选项")
-        frm_tf.pack(fill="x", **pad)
-        ttk.Checkbutton(
-            frm_tf, variable=self.var_tf,
-            text="计算 TF 标准化词频 — 在 Sheet1 中为每个分类添加 TF 列（分类词频 / 该行总命中数）"
-        ).pack(anchor="w", padx=5, pady=2)
-        ttk.Checkbutton(
-            frm_tf, variable=self.var_sentences,
-            text="导出命中句子 — 提取包含关键词的原文句子，用于论文引用验证（大数据集较慢）"
-        ).pack(anchor="w", padx=5, pady=(0, 5))
+        # ── 性能 & 输出路径 ──────────────────────────────────────────
+        frm_misc = ttk.LabelFrame(tab, text="性能与输出")
+        frm_misc.pack(fill="x", **pad)
 
-        frm_jieba = ttk.LabelFrame(tab, text="自定义 jieba 用户词典 — 提升中文分词准确率（仅 jieba 模式）")
+        row_m1 = ttk.Frame(frm_misc)
+        row_m1.pack(fill="x", padx=8, pady=(6, 3))
+        ttk.Label(row_m1, text="并发文件数：").pack(side="left")
+        ttk.Entry(row_m1, textvariable=self.analysis_workers_var, width=5).pack(side="left", padx=(4, 8))
+        ttk.Label(row_m1, text="1 = 单线程  |  4–8 = 推荐（M4 Pro）  |  建议 ≤ 16",
+                  foreground="#666666").pack(side="left")
+
+        row_m2 = ttk.Frame(frm_misc)
+        row_m2.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(row_m2, text="输出文件路径：").pack(side="left")
+        ttk.Entry(row_m2, textvariable=self.output_path, width=42,
+                  state="readonly").pack(side="left", padx=(4, 6), fill="x", expand=True)
+        ttk.Button(row_m2, text="选择路径", command=self._choose_output).pack(side="left")
+
+        # ── LLM 句子分析 ─────────────────────────────────────────────
+        frm_llm = ttk.LabelFrame(tab, text="大语言模型句子分析（OpenAI 兼容接口）")
+        frm_llm.pack(fill="x", **pad)
+
+        row_l0 = ttk.Frame(frm_llm)
+        row_l0.pack(fill="x", padx=8, pady=(6, 4))
+        ttk.Checkbutton(
+            row_l0, variable=self.var_llm,
+            text="启用 LLM 分析  （对命中句子自动标注：时间指向 / 语态 / 句子类型 / 确定性 / 量化属性 / 语气）",
+        ).pack(side="left")
+
+        ttk.Separator(frm_llm, orient="horizontal").pack(fill="x", padx=8, pady=2)
+
+        # Grid 布局让左侧标签右对齐，右侧控件填满
+        grid_frm = ttk.Frame(frm_llm)
+        grid_frm.pack(fill="x", padx=8, pady=4)
+        grid_frm.columnconfigure(1, weight=1)
+
+        # Row 0: API Key
+        ttk.Label(grid_frm, text="API Key：", anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(0, 4), pady=3)
+        key_row = ttk.Frame(grid_frm)
+        key_row.grid(row=0, column=1, sticky="ew", pady=3)
+        self._llm_api_key_entry = ttk.Entry(
+            key_row, textvariable=self.llm_api_key_var, show="*")
+        self._llm_api_key_entry.pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(
+            key_row, text="显示",
+            variable=self.llm_show_key_var,
+            command=self._toggle_api_key_visibility,
+        ).pack(side="left", padx=(6, 0))
+
+        # Row 1: Base URL
+        ttk.Label(grid_frm, text="Base URL：", anchor="e").grid(
+            row=1, column=0, sticky="e", padx=(0, 4), pady=3)
+        url_row = ttk.Frame(grid_frm)
+        url_row.grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Entry(url_row, textvariable=self.llm_base_url_var).pack(
+            side="left", fill="x", expand=True)
+        ttk.Label(url_row, text=" 兼容 OpenAI 接口的任何服务",
+                  foreground="#666666").pack(side="left")
+
+        # Row 2: Model + 测试连接
+        ttk.Label(grid_frm, text="模型名称：", anchor="e").grid(
+            row=2, column=0, sticky="e", padx=(0, 4), pady=3)
+        model_row = ttk.Frame(grid_frm)
+        model_row.grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Entry(model_row, textvariable=self.llm_model_var, width=24).pack(
+            side="left", padx=(0, 8))
+        ttk.Label(model_row, text="如：qwen-turbo / qwen-plus / qwen-max / gpt-4o-mini",
+                  foreground="#666666").pack(side="left")
+        ttk.Button(model_row, text="测试连接",
+                   command=self._test_llm_connection).pack(side="right")
+
+        # Row 3: 句子上限 / 并发 / 重试
+        ttk.Label(grid_frm, text="参数：", anchor="e").grid(
+            row=3, column=0, sticky="e", padx=(0, 4), pady=3)
+        param_row = ttk.Frame(grid_frm)
+        param_row.grid(row=3, column=1, sticky="ew", pady=3)
+        ttk.Label(param_row, text="句子上限").pack(side="left")
+        ttk.Entry(param_row, textvariable=self.llm_max_sentences_var, width=7).pack(
+            side="left", padx=(3, 14))
+        ttk.Label(param_row, text="并发线程").pack(side="left")
+        ttk.Entry(param_row, textvariable=self.llm_max_workers_var, width=5).pack(
+            side="left", padx=(3, 14))
+        ttk.Label(param_row, text="最大重试").pack(side="left")
+        ttk.Entry(param_row, textvariable=self.llm_max_retries_var, width=5).pack(
+            side="left", padx=(3, 0))
+        ttk.Label(param_row,
+                  text="  每句约 200–500 token，正式跑前请估算费用",
+                  foreground="#cc6600").pack(side="left")
+
+        # Row 4: 缓存文件
+        ttk.Label(grid_frm, text="缓存文件：", anchor="e").grid(
+            row=4, column=0, sticky="e", padx=(0, 4), pady=3)
+        cache_row = ttk.Frame(grid_frm)
+        cache_row.grid(row=4, column=1, sticky="ew", pady=(3, 8))
+        ttk.Checkbutton(
+            cache_row, text="自定义路径",
+            variable=self.llm_cache_custom_var,
+            command=self._on_llm_cache_toggle,
+        ).pack(side="left", padx=(0, 4))
+        self._llm_cache_entry = ttk.Entry(
+            cache_row, textvariable=self.llm_cache_path_var, state="disabled")
+        self._llm_cache_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._llm_cache_btn = ttk.Button(
+            cache_row, text="选择", state="disabled",
+            command=self._choose_llm_cache_path,
+        )
+        self._llm_cache_btn.pack(side="left", padx=(0, 8))
+        ttk.Label(cache_row,
+                  text="不勾选则与输出文件同目录，重复运行自动跳过已分析句子",
+                  foreground="#666666").pack(side="left")
+
+        # ── jieba 自定义词典 ──────────────────────────────────────────
+        frm_jieba = ttk.LabelFrame(tab, text="jieba 用户词典（仅 jieba 模式，可选）")
         frm_jieba.pack(fill="x", **pad)
         row_jb = ttk.Frame(frm_jieba)
-        row_jb.pack(fill="x", padx=5, pady=5)
+        row_jb.pack(fill="x", padx=8, pady=6)
         ttk.Entry(row_jb, textvariable=self.jieba_dict_path, width=50,
-                  state="readonly").pack(side="left", padx=(0, 5))
-        ttk.Button(row_jb, text="选择", command=self._choose_jieba_dict).pack(side="left")
-
-        frm_out = ttk.LabelFrame(tab, text="输出文件路径 — 生成的面板数据 Excel 保存位置")
-        frm_out.pack(fill="x", **pad)
-        row_out = ttk.Frame(frm_out)
-        row_out.pack(fill="x", padx=5, pady=5)
-        ttk.Entry(row_out, textvariable=self.output_path, width=50,
-                  state="readonly").pack(side="left", fill="x", expand=True, padx=(0, 5))
-        ttk.Button(row_out, text="选择路径", command=self._choose_output).pack(side="left")
+                  state="readonly").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(row_jb, text="选择文件", command=self._choose_jieba_dict).pack(side="left")
 
     # ---- 标签页4：运行分析 ----
 
@@ -1305,9 +1684,11 @@ class WordFreqApp(tk.Tk):
         self._update_dict_info()
 
     def _refresh_word_list(self, category: str):
+        query = self._word_search_var.get().strip().lower() if hasattr(self, "_word_search_var") else ""
         self.word_listbox.delete(0, tk.END)
         for w in self.dict_mgr.words(category):
-            self.word_listbox.insert(tk.END, w)
+            if not query or query in w.lower():
+                self.word_listbox.insert(tk.END, w)
 
     def _selected_category(self) -> str | None:
         sel = self.cat_listbox.curselection()
@@ -1364,15 +1745,64 @@ class WordFreqApp(tk.Tk):
     def _word_remove(self):
         cat = self._selected_category()
         if not cat:
+            messagebox.showwarning("提示", "请先选择一个分类。")
             return
         sel = self.word_listbox.curselection()
         if not sel:
-            messagebox.showwarning("提示", "请先选择要删除的关键词。")
+            messagebox.showwarning("提示", "请先选择要删除的关键词（可多选）。")
             return
-        word = self.word_listbox.get(sel[0])
-        self.dict_mgr.remove_word(cat, word)
+        words = [self.word_listbox.get(i) for i in sel]
+        if len(words) > 1:
+            if not messagebox.askyesno("确认", f"确定删除选中的 {len(words)} 个关键词？"):
+                return
+        for word in words:
+            self.dict_mgr.remove_word(cat, word)
         self._refresh_word_list(cat)
         self._refresh_cat_list()
+
+    def _cat_rename(self):
+        cat = self._selected_category()
+        if not cat:
+            messagebox.showwarning("提示", "请先选择要重命名的分类。")
+            return
+        new_name = simpledialog.askstring("重命名分类", f"当前名称：{cat}\n新名称：", parent=self)
+        if not new_name or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name == cat:
+            return
+        if new_name in self.dict_mgr.data:
+            messagebox.showwarning("提示", f"分类「{new_name}」已存在。")
+            return
+        # Rename: copy data under new key
+        words = self.dict_mgr.data.pop(cat)
+        self.dict_mgr.data[new_name] = words
+        self._refresh_cat_list()
+        self.word_listbox.delete(0, tk.END)
+
+    def _word_clear_all(self):
+        cat = self._selected_category()
+        if not cat:
+            messagebox.showwarning("提示", "请先选择一个分类。")
+            return
+        n = len(self.dict_mgr.words(cat))
+        if n == 0:
+            return
+        if messagebox.askyesno("确认", f"确定清空分类「{cat}」的全部 {n} 个关键词？"):
+            self.dict_mgr.data[cat] = []
+            self._refresh_word_list(cat)
+            self._refresh_cat_list()
+
+    def _on_word_search(self, *_args):
+        """根据搜索框内容过滤关键词列表。"""
+        cat = self._selected_category()
+        if not cat:
+            return
+        query = self._word_search_var.get().strip().lower()
+        self.word_listbox.delete(0, tk.END)
+        for w in self.dict_mgr.words(cat):
+            if not query or query in w.lower():
+                self.word_listbox.insert(tk.END, w)
 
     def _dict_new(self):
         if self.dict_mgr.total_word_count() > 0:
@@ -1443,6 +1873,66 @@ class WordFreqApp(tk.Tk):
         )
         if path:
             self.jieba_dict_path.set(path)
+
+    def _toggle_api_key_visibility(self):
+        if self._llm_api_key_entry is None:
+            return
+        self._llm_api_key_entry.configure(
+            show="" if self.llm_show_key_var.get() else "*"
+        )
+
+    def _on_llm_cache_toggle(self):
+        state = "normal" if self.llm_cache_custom_var.get() else "disabled"
+        if self._llm_cache_entry:
+            self._llm_cache_entry.configure(state=state)
+        if self._llm_cache_btn:
+            self._llm_cache_btn.configure(state=state)
+
+    def _choose_llm_cache_path(self):
+        path = filedialog.asksaveasfilename(
+            title="选择 LLM 缓存文件保存位置",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.llm_cache_path_var.set(path)
+
+    def _test_llm_connection(self):
+        api_key = self.llm_api_key_var.get().strip()
+        base_url = self.llm_base_url_var.get().strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        model = self.llm_model_var.get().strip() or "qwen-plus"
+        if not api_key:
+            messagebox.showwarning("提示", "请先填写 API Key。")
+            return
+
+        def _do_test():
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"), timeout=20.0)
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "请回复 OK"}],
+                    max_tokens=10,
+                    temperature=0,
+                )
+                reply = (resp.choices[0].message.content or "").strip()
+                self.after(0, lambda: messagebox.showinfo(
+                    "连接成功",
+                    f"模型：{model}\n接口回复：{reply}\n\nAPI Key 和 Base URL 验证通过。"
+                ))
+            except ImportError:
+                self.after(0, lambda: messagebox.showerror(
+                    "缺少依赖", "请先安装 openai 库：\npip install openai"
+                ))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: messagebox.showerror(
+                    "连接失败",
+                    f"错误信息：\n{err}\n\n请检查 API Key、Base URL 和网络连接。"
+                ))
+
+        threading.Thread(target=_do_test, daemon=True).start()
+        messagebox.showinfo("测试中", f"正在连接 {model}，请稍候（最多等待 20 秒）...")
 
     def _choose_output(self):
         path = filedialog.asksaveasfilename(
@@ -1527,6 +2017,42 @@ class WordFreqApp(tk.Tk):
             messagebox.showwarning("提示", "请在「分析设置」选择输出路径。")
             return
 
+        llm_max_sentences = 500
+        llm_max_workers = 4
+        llm_max_retries = 2
+        llm_cache_path = None
+        llm_api_key = self.llm_api_key_var.get().strip()
+        llm_model = self.llm_model_var.get().strip() or "qwen-plus"
+        llm_base_url = self.llm_base_url_var.get().strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        if self.var_llm.get():
+            if not self.var_sentences.get():
+                if not messagebox.askyesno(
+                    "提示",
+                    "LLM 句子分析依赖导出命中句子。是否自动启用后继续？",
+                ):
+                    return
+                self.var_sentences.set(True)
+            if not llm_api_key and not os.getenv("DASHSCOPE_API_KEY", "").strip():
+                messagebox.showwarning(
+                    "提示",
+                    "启用 LLM 句子分析时需要 API Key。\n请在界面中填写，或先设置环境变量 DASHSCOPE_API_KEY。",
+                )
+                return
+            try:
+                llm_max_sentences = max(1, int(self.llm_max_sentences_var.get().strip() or "500"))
+                llm_max_workers = max(1, int(self.llm_max_workers_var.get().strip() or "4"))
+                llm_max_retries = max(1, int(self.llm_max_retries_var.get().strip() or "2"))
+            except ValueError:
+                messagebox.showwarning("提示", "LLM 的数值参数（句子上限、并发线程、最大重试）必须是正整数。")
+                return
+            if self.llm_cache_custom_var.get():
+                custom = self.llm_cache_path_var.get().strip()
+                if custom:
+                    llm_cache_path = custom
+                else:
+                    messagebox.showwarning("提示", "已勾选自定义缓存路径，但未选择文件位置。")
+                    return
+
         # 停用词
         stopwords: set[str] = set()
         if self.var_stopwords.get():
@@ -1560,6 +2086,15 @@ class WordFreqApp(tk.Tk):
             stopwords=stopwords,
             use_tf=self.var_tf.get(),
             export_sentences=self.var_sentences.get(),
+            analyze_llm=self.var_llm.get(),
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+            llm_max_sentences=llm_max_sentences,
+            llm_max_workers=llm_max_workers,
+            llm_max_retries=llm_max_retries,
+            llm_cache_path=llm_cache_path,
+            analysis_workers=max(1, int(self.analysis_workers_var.get().strip() or "1")),
             jieba_userdict=self.jieba_dict_path.get(),
             progress_cb=self._update_progress,
             log_cb=log_with_status,
