@@ -436,7 +436,9 @@ def parse_year_column(series: pd.Series) -> pd.Series:
     except (ValueError, TypeError):
         dates = pd.to_datetime(series, errors="coerce")
     years = dates.dt.year
-    candidates.append(years.fillna(0).astype(int))
+    # 与策略 1 保持一致：超范围年份（如 2200-01-01）置 0，不入库
+    valid_year_mask = years.between(1900, 2100)
+    candidates.append(years.where(valid_year_mask, 0).fillna(0).astype(int))
 
     # 策略 3：正则提取 4 位年份
     extracted = series.astype(str).str.extract(r"((?:19|20)\d{2})", expand=False)
@@ -761,6 +763,13 @@ def run_analysis(
     if bad_cats:
         log(f"警告：以下分类名与系统保留列名冲突，已自动跳过：{bad_cats}")
         categories = [c for c in categories if c not in _reserved]
+    # 过滤后若关键词全部被移除，给出明确的参数错误（而非后续聚合时的"无文件"误导）
+    if not keywords:
+        raise ValueError(
+            "过滤与系统保留列名冲突的关键词后，词典已空。\n"
+            f"被跳过的关键词：{bad_kws}\n"
+            "请修改词典，避免使用「公司代码」「年份」「总计」等系统保留字作为关键词。"
+        )
 
     if len(keywords) > 1000:
         log(f"提示：关键词数量较大（{len(keywords)}），分析可能较慢。")
@@ -965,10 +974,13 @@ def run_analysis(
     sheet4_rows = 0
     if hit_sentences:
         df_sent = pd.DataFrame(hit_sentences)
-        # 排序：并发模式下文件完成顺序不确定，排序保证多次运行序号可复现
-        _sort_cols = [c for c in ["公司代码", "年份", "分类", "命中关键词"] if c in df_sent.columns]
+        # 排序：并发模式下文件完成顺序不确定，排序保证多次运行序号可复现。
+        # 加入「命中句子」确保同关键词下多句之间也有确定顺序；
+        # kind="stable" 保证完全相同的记录在原始 DataFrame 中的相对顺序不变。
+        _sort_cols = [c for c in ["公司代码", "年份", "分类", "命中关键词", "命中句子"]
+                      if c in df_sent.columns]
         if _sort_cols:
-            df_sent = df_sent.sort_values(_sort_cols).reset_index(drop=True)
+            df_sent = df_sent.sort_values(_sort_cols, kind="stable").reset_index(drop=True)
         sheet4_rows = len(df_sent)
 
         if analyze_llm:
