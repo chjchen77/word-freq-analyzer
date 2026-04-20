@@ -615,7 +615,10 @@ def _process_chunk(
 
     n_hits = int(df[keywords].sum().sum())
 
-    # 提取命中句子（合并 regex：O(n) 替代 O(n×k) 逐词搜索，显著提速）
+    # 提取命中句子
+    # 用 str.__contains__（C 级 Boyer-Moore 搜索）替代 re.search：
+    #   · 正确处理关键词互为子串的情况（不存在交替遮蔽问题）
+    #   · 比 re.search 更快，且预计算 lower() 避免重复开销
     if do_export_sentences and n_hits > 0:
         match_mask = df[keywords].sum(axis=1) > 0
         for row_idx in df[match_mask].index:
@@ -625,17 +628,12 @@ def _process_chunk(
             row_kws = [kw for kw in keywords if df.loc[row_idx, kw] > 0]
             if not row_kws:
                 continue
-            # 一次 findall 扫描整个句子，匹配所有关键词
-            combined_re = re.compile(
-                "(" + "|".join(re.escape(kw) for kw in row_kws) + ")",
-                re.IGNORECASE,
-            )
-            kw_lower_map = {kw.lower(): kw for kw in row_kws}
+            # 每行预计算一次，避免在句子循环内重复 lower()
+            kw_lower_pairs = [(kw, kw.lower()) for kw in row_kws]
             for sent in split_sentences(text):
-                found = {m.lower() for m in combined_re.findall(sent)}
-                for kw_lower in found:
-                    if kw_lower in kw_lower_map:
-                        kw = kw_lower_map[kw_lower]
+                sent_lower = sent.lower()
+                for kw, kw_l in kw_lower_pairs:
+                    if kw_l in sent_lower:
                         hit_sents.append({
                             "公司代码": stkcd,
                             "年份": year,
