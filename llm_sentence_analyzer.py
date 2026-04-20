@@ -420,7 +420,9 @@ class QwenSentenceAnalyzer:
                 result_by_key[key] = cached
                 cache_hits += 1
                 continue
-            if len(pending_keys) < self.config.max_sentences:
+            # max_sentences <= 0 表示无上限
+            no_limit = self.config.max_sentences <= 0
+            if no_limit or len(pending_keys) < self.config.max_sentences:
                 pending_keys.append(key)
             else:
                 skipped_keys.append(key)
@@ -436,9 +438,10 @@ class QwenSentenceAnalyzer:
             for key in skipped_keys:
                 result_by_key[key] = _skipped_result()
 
+        limit_desc = "无上限" if self.config.max_sentences <= 0 else str(self.config.max_sentences)
         if pending_keys:
             self._log(
-                f"正在调用 LLM 分析句子：新增 {len(pending_keys)} 条，"
+                f"正在调用 LLM 分析句子：新增 {len(pending_keys)} 条（上限：{limit_desc}），"
                 f"线程数 {self.config.max_workers}，模型 {self.config.model}。"
             )
             # 修复：进度日志颗粒度改为每 10 条或总量的 10%，以较小者为准

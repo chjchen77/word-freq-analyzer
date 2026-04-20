@@ -455,6 +455,18 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in parts if len(s.strip()) >= 8]
 
 
+def _mp_worker_init(all_dict_words_: set, jieba_userdict_: str, use_regex_: bool):
+    """ProcessPoolExecutor worker 初始化：非正则模式时在子进程中加载 jieba 词典。
+    每个 worker 进程只执行一次，之后重用已初始化的 jieba 实例。
+    """
+    if not use_regex_ and all_dict_words_:
+        import jieba as _jieba
+        if jieba_userdict_ and os.path.isfile(jieba_userdict_):
+            _jieba.load_userdict(jieba_userdict_)
+        for w in all_dict_words_:
+            _jieba.add_word(w)
+
+
 def _process_one_file(
     fpath: str,
     col_stkcd: str,
@@ -571,8 +583,7 @@ def _process_chunk(
     df["_stkcd"] = df[col_stkcd].apply(fix_stock_code)
     df["_year"] = parse_year_column(df[col_year])
     dropped_years = (df["_year"] == 0).sum()
-    if dropped_years > 0:
-        log(f"  警告：{dropped_years} 行因年份无法解析（值为0）已跳过。")
+    # 注意：_process_chunk 可在子进程中运行，log 不在作用域；年份警告由调用方汇总
     df = df[df["_year"] > 0].copy()  # v3.0: .copy() 防止 SettingWithCopyWarning
     if len(df) == 0:
         return None, raw_rows, 0, []
@@ -604,7 +615,7 @@ def _process_chunk(
 
     n_hits = int(df[keywords].sum().sum())
 
-    # 提取命中句子
+    # 提取命中句子（合并 regex：O(n) 替代 O(n×k) 逐词搜索，显著提速）
     if do_export_sentences and n_hits > 0:
         match_mask = df[keywords].sum(axis=1) > 0
         for row_idx in df[match_mask].index:
@@ -612,9 +623,19 @@ def _process_chunk(
             stkcd = df.loc[row_idx, "_stkcd"]
             year = int(df.loc[row_idx, "_year"])
             row_kws = [kw for kw in keywords if df.loc[row_idx, kw] > 0]
+            if not row_kws:
+                continue
+            # 一次 findall 扫描整个句子，匹配所有关键词
+            combined_re = re.compile(
+                "(" + "|".join(re.escape(kw) for kw in row_kws) + ")",
+                re.IGNORECASE,
+            )
+            kw_lower_map = {kw.lower(): kw for kw in row_kws}
             for sent in split_sentences(text):
-                for kw in row_kws:
-                    if re.search(re.escape(kw), sent, re.IGNORECASE):
+                found = {m.lower() for m in combined_re.findall(sent)}
+                for kw_lower in found:
+                    if kw_lower in kw_lower_map:
+                        kw = kw_lower_map[kw_lower]
                         hit_sents.append({
                             "公司代码": stkcd,
                             "年份": year,
@@ -762,17 +783,23 @@ def run_analysis(
                 progress_cb(idx, total_files)
 
     else:
-        # ── 多线程并发模式（高性能设备）────────────────────────────────
-        log(f"并发模式：{_workers} 个线程同时处理文件（注意日志顺序可能与文件顺序不同）")
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=_workers) as executor:
+        # ── 多进程并发模式（真并行，充分利用多核 CPU）─────────────────
+        log(f"并发模式：{_workers} 进程（多进程真并行，M4 Pro 等多核设备推荐）")
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        _jieba_userdict = jieba_userdict  # 传给 worker 初始化
+        executor = ProcessPoolExecutor(
+            max_workers=_workers,
+            initializer=_mp_worker_init,
+            initargs=(all_dict_words, _jieba_userdict, use_regex),
+        )
+        try:
             future_map = {
                 executor.submit(
                     _process_one_file,
                     fpath, col_stkcd, col_year, text_columns,
                     keywords, use_regex, all_dict_words,
                     stopwords, use_stopwords, export_sentences,
-                    word_to_cat, agg_rules, cancel_event,
+                    word_to_cat, agg_rules, None,  # 子进程不传 cancel_event
                 ): (i + 1, fpath)
                 for i, fpath in enumerate(files)
             }
@@ -798,8 +825,11 @@ def run_analysis(
                 if progress_cb:
                     progress_cb(completed, total_files)
                 if is_cancelled():
-                    log("用户已取消。")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    log("用户已取消，等待当前批次完成…")
                     break
+        finally:
+            executor.shutdown(wait=True)
 
     if is_cancelled():
         raise ValueError("分析已被用户取消。")
@@ -1036,6 +1066,8 @@ class WordFreqApp(tk.Tk):
             value=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         )
         self.llm_max_sentences_var = tk.StringVar(value="500")
+        self.var_llm_no_limit = tk.BooleanVar(value=False)
+        self._llm_sent_entry = None  # 句子上限 Entry 引用，用于启用/禁用
         self.llm_max_workers_var = tk.StringVar(value="4")
         self.llm_max_retries_var = tk.StringVar(value="2")
         self.llm_cache_custom_var = tk.BooleanVar(value=False)
@@ -1416,8 +1448,14 @@ class WordFreqApp(tk.Tk):
         param_row = ttk.Frame(grid_frm)
         param_row.grid(row=3, column=1, sticky="ew", pady=3)
         ttk.Label(param_row, text="句子上限").pack(side="left")
-        ttk.Entry(param_row, textvariable=self.llm_max_sentences_var, width=7).pack(
-            side="left", padx=(3, 14))
+        self._llm_sent_entry = ttk.Entry(
+            param_row, textvariable=self.llm_max_sentences_var, width=7)
+        self._llm_sent_entry.pack(side="left", padx=(3, 4))
+        ttk.Checkbutton(
+            param_row, text="不限制",
+            variable=self.var_llm_no_limit,
+            command=self._on_llm_no_limit_toggle,
+        ).pack(side="left", padx=(0, 14))
         ttk.Label(param_row, text="并发线程").pack(side="left")
         ttk.Entry(param_row, textvariable=self.llm_max_workers_var, width=5).pack(
             side="left", padx=(3, 14))
@@ -1881,6 +1919,14 @@ class WordFreqApp(tk.Tk):
             show="" if self.llm_show_key_var.get() else "*"
         )
 
+    def _on_llm_no_limit_toggle(self):
+        """勾选「不限制」时禁用句子上限输入框。"""
+        if self._llm_sent_entry is None:
+            return
+        self._llm_sent_entry.configure(
+            state="disabled" if self.var_llm_no_limit.get() else "normal"
+        )
+
     def _on_llm_cache_toggle(self):
         state = "normal" if self.llm_cache_custom_var.get() else "disabled"
         if self._llm_cache_entry:
@@ -2039,11 +2085,14 @@ class WordFreqApp(tk.Tk):
                 )
                 return
             try:
-                llm_max_sentences = max(1, int(self.llm_max_sentences_var.get().strip() or "500"))
+                if self.var_llm_no_limit.get():
+                    llm_max_sentences = 0  # 0 = 无上限
+                else:
+                    llm_max_sentences = max(1, int(self.llm_max_sentences_var.get().strip() or "500"))
                 llm_max_workers = max(1, int(self.llm_max_workers_var.get().strip() or "4"))
                 llm_max_retries = max(1, int(self.llm_max_retries_var.get().strip() or "2"))
             except ValueError:
-                messagebox.showwarning("提示", "LLM 的数值参数（句子上限、并发线程、最大重试）必须是正整数。")
+                messagebox.showwarning("提示", "LLM 的数值参数（并发线程、最大重试）必须是正整数。")
                 return
             if self.llm_cache_custom_var.get():
                 custom = self.llm_cache_path_var.get().strip()
