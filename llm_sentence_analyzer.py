@@ -25,6 +25,12 @@ _REQUEST_TIMEOUT = 60.0
 # 重试退避基础秒数（第 n 次重试等待 n * _RETRY_BACKOFF_BASE 秒）
 _RETRY_BACKOFF_BASE = 1.0
 
+# 429 限速专项重试上限（独立于普通错误重试，指数退避最长 60s）
+_MAX_RATE_LIMIT_RETRIES = 10
+
+# 增量缓存：每成功 N 条写一次盘，防止长时间运行中途崩溃丢失进度
+_CACHE_SAVE_INTERVAL = 50
+
 TIME_ORIENTATION_VALUES = ("过去", "当前", "未来", "混合", "不明显")
 VOICE_VALUES = ("主动", "被动", "不明显")
 SENTENCE_TYPE_VALUES = ("回顾总结", "现状描述", "未来规划", "风险提示", "措施行动", "结果成效", "其他")
@@ -286,9 +292,12 @@ class QwenSentenceAnalyzer:
         path = Path(self.config.cache_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
+        # 先在锁内做快照，再在锁外写盘，避免写盘期间阻塞其他线程
+        with self._cache_lock:
+            cache_snapshot = dict(self._cache)
         try:
             with temp_path.open("w", encoding="utf-8") as f:
-                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+                json.dump(cache_snapshot, f, ensure_ascii=False, indent=2)
             temp_path.replace(path)
         except Exception as exc:
             self._log(f"警告：LLM 缓存保存失败：{exc}")
@@ -397,23 +406,50 @@ class QwenSentenceAnalyzer:
         return self._normalize_result(parsed)
 
     def _analyze_unique_record(self, record: dict[str, Any]) -> dict[str, str]:
-        """带退避重试的单条记录分析。遇到限速（429）时指数退避后重试。"""
+        """带退避重试的单条记录分析。
+
+        - 普通错误：最多 max_retries 次，线性退避（n × _RETRY_BACKOFF_BASE 秒）
+        - 429 限速：最多 _MAX_RATE_LIMIT_RETRIES 次，指数退避（5→10→20→40→60s）
+          429 计数与普通错误计数独立，确保限速重试不占用普通错误重试次数。
+        """
         last_error = ""
-        for attempt in range(1, self.config.max_retries + 1):
+        generic_attempts = 0
+        rate_limit_attempts = 0
+
+        while True:
             if self._is_cancelled():
                 return _cancelled_result()
             try:
                 return self._request_once(record)
             except Exception as exc:
                 last_error = str(exc)
-                if attempt >= self.config.max_retries:
-                    break
-                # 修复：重试前等待，避免限速时立刻再次触发 429
-                backoff = attempt * _RETRY_BACKOFF_BASE
-                # 限速错误等待时间加倍
-                if "429" in last_error or "rate" in last_error.lower():
-                    backoff *= 3
-                time.sleep(backoff)
+                exc_lower = last_error.lower()
+                is_rate_limit = (
+                    "429" in last_error
+                    or "rate_limit" in exc_lower
+                    or "ratelimit" in exc_lower
+                    or ("rate" in exc_lower and "limit" in exc_lower)
+                )
+
+                if is_rate_limit:
+                    rate_limit_attempts += 1
+                    if rate_limit_attempts > _MAX_RATE_LIMIT_RETRIES:
+                        # 超过限速重试上限，直接返回失败
+                        break
+                    backoff = min(60.0, 5.0 * (2 ** (rate_limit_attempts - 1)))
+                    # 只在首次触发时记录日志，避免淹没进度信息
+                    if rate_limit_attempts == 1:
+                        self._log(
+                            f"  API 限速（429），将等待 {backoff:.0f}s 后重试"
+                            f"（最多还可重试 {_MAX_RATE_LIMIT_RETRIES - rate_limit_attempts} 次）…"
+                        )
+                    time.sleep(backoff)
+                else:
+                    generic_attempts += 1
+                    if generic_attempts >= self.config.max_retries:
+                        break
+                    backoff = generic_attempts * _RETRY_BACKOFF_BASE
+                    time.sleep(backoff)
 
         return _failed_result(last_error[:200])
 
@@ -480,6 +516,7 @@ class QwenSentenceAnalyzer:
                 }
                 completed = 0
                 failed = 0
+                successes = 0  # 用于触发增量缓存写盘
                 for future in as_completed(future_to_key):
                     key = future_to_key[future]
                     completed += 1
@@ -488,6 +525,11 @@ class QwenSentenceAnalyzer:
                     if result.get("LLM分析状态") == "成功":
                         with self._cache_lock:
                             self._cache[key] = result
+                        successes += 1
+                        # 增量保存：每 _CACHE_SAVE_INTERVAL 条成功结果写一次盘，
+                        # 防止长时间运行中途崩溃导致所有进度丢失
+                        if successes % _CACHE_SAVE_INTERVAL == 0:
+                            self._save_cache()
                     elif result.get("LLM分析状态") == "失败":
                         failed += 1
                     # 修复：更细粒度的进度日志，小批量也能及时反馈
