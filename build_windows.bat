@@ -28,7 +28,7 @@ if errorlevel 1 (
 
 REM 检查并安装依赖
 echo 检查依赖...
-pip install -q pyinstaller jieba pandas openpyxl xlrd
+pip install -q pyinstaller jieba pandas openpyxl xlrd openai
 
 REM 清理旧构建
 if exist build rmdir /s /q build
@@ -38,12 +38,14 @@ if exist *.spec del /f /q *.spec
 echo 开始打包...
 
 pyinstaller ^
-    --onefile ^
+    --onedir ^
     --windowed ^
     --name "词频统计分析工具" ^
+    --hidden-import llm_sentence_analyzer ^
     --hidden-import jieba ^
     --hidden-import openpyxl ^
     --hidden-import xlrd ^
+    --hidden-import openai ^
     --hidden-import jieba.finalseg ^
     --hidden-import jieba.posseg ^
     --hidden-import jieba.analyse ^
@@ -73,12 +75,12 @@ echo ================================================
 echo   打包完成！
 echo ================================================
 echo.
-echo 可执行文件: dist\词频统计分析工具.exe
+echo 程序目录: dist\词频统计分析工具\
 echo.
 echo 使用方式:
-echo   双击 dist\词频统计分析工具.exe 即可运行
+echo   双击 dist\词频统计分析工具\词频统计分析工具.exe 即可运行
 echo.
 echo 分发方式:
-echo   将 dist\词频统计分析工具.exe 压缩为 .zip 发送给他人
+echo   将 dist\词频统计分析工具\ 整个文件夹压缩为 .zip 发送给他人
 echo.
 pause

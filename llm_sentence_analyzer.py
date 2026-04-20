@@ -88,8 +88,17 @@ def _clean_json_string(text: str) -> str:
 
 
 def _safe_int(value: Any, default: int) -> int:
+    """解析正整数，最小值为 1。用于 max_workers、max_retries 等只能为正数的参数。"""
     try:
         return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_nonneg_int(value: Any, default: int) -> int:
+    """解析非负整数，允许 0。max_sentences=0 表示「无上限」，必须用此函数而非 _safe_int。"""
+    try:
+        return max(0, int(value))
     except (TypeError, ValueError):
         return default
 
@@ -150,7 +159,7 @@ class LLMAnalyzerConfig:
             model=resolved_model,
             base_url=resolved_base_url.rstrip("/"),
             max_workers=_safe_int(max_workers, 4),
-            max_sentences=_safe_int(max_sentences, 500),
+            max_sentences=_safe_nonneg_int(max_sentences, 500),  # 0 = 无上限，不能用 _safe_int
             max_retries=_safe_int(max_retries, 2),
             cache_path=cache_path,
         )

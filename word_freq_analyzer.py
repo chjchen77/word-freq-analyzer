@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-中文文本词频统计分析工具 v3.0
+中文文本词频统计分析工具 v4.0
 ==============================
 科研级面板数据词频统计。输出 公司×年份 面板数据格式。
 支持分类词典管理、正则/jieba 双模式、命中句子导出。
@@ -207,16 +207,23 @@ def collect_data_files(folders: list[str]) -> tuple[list[str], dict[str, int], l
     """
     递归扫描文件夹，返回 (文件列表, 子目录文件计数, 错误列表)。
     v3.0: followlinks=True 跟随符号链接；onerror 收集权限错误。
+    v4.0: 用 realpath 去重防止符号链接循环导致无限递归。
     """
     files: list[str] = []
     dir_counts: dict[str, int] = {}
     errors: list[str] = []
+    seen_realpaths: set[str] = set()  # 防止符号链接循环
 
     def _on_error(err):
         errors.append(str(err))
 
     for folder in folders:
-        for root, _, filenames in os.walk(folder, followlinks=True, onerror=_on_error):
+        for root, dirs, filenames in os.walk(folder, followlinks=True, onerror=_on_error):
+            real_root = os.path.realpath(root)
+            if real_root in seen_realpaths:
+                dirs[:] = []  # 已访问过，阻止 os.walk 继续深入
+                continue
+            seen_realpaths.add(real_root)
             found = 0
             for fname in sorted(filenames):
                 if fname.startswith("~$") or fname.startswith("."):
@@ -406,32 +413,38 @@ def fix_stock_code(code) -> str:
 
 
 def parse_year_column(series: pd.Series) -> pd.Series:
-    """智能解析年份列：支持数值、日期字符串、混合格式。"""
+    """智能解析年份列：支持数值、日期字符串、混合格式。
+
+    修复：原实现用 30% 阈值选策略；若三种策略均低于 30%，整列返回 0，
+    导致有效年份行被全量丢弃（静默数据损失）。
+    新实现：对每种策略计算有效年份数，取最多的那种；只要找到 >=1 个有效年份
+    就使用该策略，无效行置 0 交由调用方过滤，不再静默丢弃整列。
+    """
     if series.empty:
         return pd.Series(dtype=int)
 
-    # 尝试直接数值
-    numeric = pd.to_numeric(series, errors="coerce")
-    valid = numeric.between(1900, 2100)
-    if valid.sum() > len(series) * 0.3:
-        return numeric.where(valid, 0).astype(int)
+    candidates: list[pd.Series] = []
 
-    # 尝试日期解析（v3.0: 移除废弃的 infer_datetime_format）
+    # 策略 1：直接数值
+    numeric = pd.to_numeric(series, errors="coerce")
+    valid_mask = numeric.between(1900, 2100)
+    candidates.append(numeric.where(valid_mask, 0).astype(int))
+
+    # 策略 2：日期解析（v3.0: 移除废弃的 infer_datetime_format）
     try:
         dates = pd.to_datetime(series, errors="coerce", format="mixed")
     except (ValueError, TypeError):
         dates = pd.to_datetime(series, errors="coerce")
     years = dates.dt.year
-    if years.notna().sum() > len(series) * 0.3:
-        return years.fillna(0).astype(int)
+    candidates.append(years.fillna(0).astype(int))
 
-    # 正则提取 4 位年份
+    # 策略 3：正则提取 4 位年份
     extracted = series.astype(str).str.extract(r"((?:19|20)\d{2})", expand=False)
     extracted_num = pd.to_numeric(extracted, errors="coerce")
-    if extracted_num.notna().sum() > len(series) * 0.3:
-        return extracted_num.fillna(0).astype(int)
+    candidates.append(extracted_num.fillna(0).astype(int))
 
-    return pd.Series(0, index=series.index)
+    # 取有效年份（非 0）最多的策略；若均为 0 则返回全 0
+    return max(candidates, key=lambda s: int((s > 0).sum()))
 
 
 def split_sentences(text: str) -> list[str]:
@@ -584,6 +597,10 @@ def _process_chunk(
     df = df.copy()
     raw_rows = len(df)  # v3.0: 在过滤前记录原始行数
     df["_stkcd"] = df[col_stkcd].apply(fix_stock_code)
+    # 过滤空/无效公司代码，防止空字符串聚合成一条虚假"公司"记录污染面板
+    _empty_stkcd_mask = df["_stkcd"].fillna("").str.strip() == ""
+    if _empty_stkcd_mask.any():
+        df = df[~_empty_stkcd_mask].copy()
     df["_year"] = parse_year_column(df[col_year])
     dropped_years = (df["_year"] == 0).sum()
     # 注意：_process_chunk 可在子进程中运行，log 不在作用域；年份警告由调用方汇总
@@ -948,6 +965,10 @@ def run_analysis(
     sheet4_rows = 0
     if hit_sentences:
         df_sent = pd.DataFrame(hit_sentences)
+        # 排序：并发模式下文件完成顺序不确定，排序保证多次运行序号可复现
+        _sort_cols = [c for c in ["公司代码", "年份", "分类", "命中关键词"] if c in df_sent.columns]
+        if _sort_cols:
+            df_sent = df_sent.sort_values(_sort_cols).reset_index(drop=True)
         sheet4_rows = len(df_sent)
 
         if analyze_llm:
@@ -1059,7 +1080,7 @@ class WordFreqApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("中文文本词频统计分析工具 v3.0 — 陈浩杰 | 澳门城市大学金融学院")
+        self.title("中文文本词频统计分析工具 v4.0 — 陈浩杰 | 澳门城市大学金融学院")
         self.geometry("1020x800")
         self.resizable(True, True)
         self.minsize(880, 680)
@@ -2146,6 +2167,13 @@ class WordFreqApp(tk.Tk):
             self._log(msg)
             self._set_current_file(msg)
 
+        # 并发进程数单独验证（在 kwargs 之外，保证异常能被捕获并提示用户）
+        try:
+            analysis_workers_val = max(1, int(self.analysis_workers_var.get().strip() or "1"))
+        except ValueError:
+            messagebox.showwarning("提示", "并发进程数必须是正整数。")
+            return
+
         kwargs = dict(
             files=list(self.scanned_files),
             dict_mgr=self.dict_mgr,
@@ -2166,7 +2194,7 @@ class WordFreqApp(tk.Tk):
             llm_max_workers=llm_max_workers,
             llm_max_retries=llm_max_retries,
             llm_cache_path=llm_cache_path,
-            analysis_workers=max(1, int(self.analysis_workers_var.get().strip() or "1")),
+            analysis_workers=analysis_workers_val,
             jieba_userdict=self.jieba_dict_path.get(),
             progress_cb=self._update_progress,
             log_cb=log_with_status,
