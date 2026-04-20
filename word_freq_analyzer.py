@@ -498,12 +498,12 @@ def _process_one_file(
     if ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
         file_chunks: list = []
         file_sents: list = []
-        file_rows = file_hits = chunk_num = 0
+        file_rows = file_hits = file_dropped = chunk_num = 0
         for chunk_df in read_csv_chunked(fpath, CHUNK_ROWS):
             if cancel_event is not None and cancel_event.is_set():
                 break
             chunk_num += 1
-            result, rows, hits, sents = _process_chunk(
+            result, rows, hits, sents, dropped = _process_chunk(
                 chunk_df, col_stkcd, col_year, text_columns,
                 keywords, use_regex, all_dict_words,
                 stopwords, use_stopwords, export_sentences, word_to_cat,
@@ -513,21 +513,24 @@ def _process_one_file(
                 file_rows += rows
                 file_hits += hits
                 file_sents.extend(sents)
+                file_dropped += dropped
         if file_chunks:
             merged = pd.concat(file_chunks, ignore_index=True)
             merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
-            return [merged], file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次"
+            dropped_note = f"（{file_dropped}行年份无效）" if file_dropped else ""
+            return [merged], file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
         return [], [], f"{display_name}  跳过：无有效数据"
     else:
         df = read_data_file(fpath)
-        result, rows, hits, sents = _process_chunk(
+        result, rows, hits, sents, dropped = _process_chunk(
             df, col_stkcd, col_year, text_columns,
             keywords, use_regex, all_dict_words,
             stopwords, use_stopwords, export_sentences, word_to_cat,
         )
         del df
         if result is not None:
-            return [result], sents, f"{display_name}  {rows}行 命中{hits}次"
+            dropped_note = f"（{dropped}行年份无效）" if dropped else ""
+            return [result], sents, f"{display_name}  {rows}行 命中{hits}次{dropped_note}"
         return [], [], f"{display_name}  跳过：缺少必需列或无有效数据"
 
 
@@ -562,21 +565,21 @@ def _process_chunk(
     use_stopwords: bool,
     do_export_sentences: bool,
     word_to_cat: dict[str, str],
-) -> tuple[pd.DataFrame | None, int, int, list[dict]]:
+) -> tuple[pd.DataFrame | None, int, int, list[dict], int]:
     """
     处理单个 DataFrame（整文件或 CSV 块）。
-    返回 (聚合后的 公司×年份 DataFrame, 原始行数, 命中次数, 命中句子列表)。
+    返回 (聚合后的 公司×年份 DataFrame, 原始行数, 命中次数, 命中句子列表, 年份无效行数)。
     """
     hit_sents: list[dict] = []
 
     if col_stkcd not in df.columns:
-        return None, 0, 0, []
+        return None, 0, 0, [], 0
     if col_year not in df.columns:
-        return None, 0, 0, []
+        return None, 0, 0, [], 0
 
     available_text = [c for c in text_columns if c in df.columns]
     if not available_text:
-        return None, 0, 0, []
+        return None, 0, 0, [], 0
 
     df = df.copy()
     raw_rows = len(df)  # v3.0: 在过滤前记录原始行数
@@ -586,7 +589,7 @@ def _process_chunk(
     # 注意：_process_chunk 可在子进程中运行，log 不在作用域；年份警告由调用方汇总
     df = df[df["_year"] > 0].copy()  # v3.0: .copy() 防止 SettingWithCopyWarning
     if len(df) == 0:
-        return None, raw_rows, 0, []
+        return None, raw_rows, 0, [], int(dropped_years)
     text_series = df[available_text].fillna("").astype(str).agg("".join, axis=1)
 
     # 关键词匹配
@@ -648,7 +651,7 @@ def _process_chunk(
     agg_rules = {kw: "sum" for kw in keywords}
     chunk_agg = chunk.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
 
-    return chunk_agg, raw_rows, n_hits, hit_sents
+    return chunk_agg, raw_rows, n_hits, hit_sents, int(dropped_years)
 
 
 def run_analysis(
@@ -705,9 +708,28 @@ def run_analysis(
         if len(duplicates) > 10:
             log(f"  …共 {len(duplicates)} 个重复词")
     # 构建词典诊断数据，写入输出文件
-    dup_rows = [{"关键词": w, "所在分类（全部）": "、".join(cats), "实际归入分类": cats[-1], "说明": "同一关键词出现在多个分类，仅计入最后一个分类"}
+    dup_rows = [{"关键词": w, "所在分类（全部）": "、".join(cats), "实际归入分类": cats[-1],
+                 "说明": "重复词：同一关键词出现在多个分类，仅计入最后一个分类"}
                 for w, cats in (duplicates or {}).items()]
-    sheet_dict_diag = pd.DataFrame(dup_rows) if dup_rows else pd.DataFrame(
+
+    # 子串关键词诊断：检测互为子串的关键词对，提示潜在重叠统计风险
+    substr_rows: list[dict] = []
+    kws_by_len = sorted(keywords, key=len)
+    for i, kw_short in enumerate(kws_by_len):
+        for kw_long in kws_by_len[i + 1:]:
+            if kw_short in kw_long:
+                cat_short = word_to_cat.get(kw_short, "")
+                substr_rows.append({
+                    "关键词": kw_short,
+                    "所在分类（全部）": cat_short,
+                    "实际归入分类": cat_short,
+                    "说明": f"子串警告：「{kw_short}」是「{kw_long}」的子串，正则模式下两者均独立计数，含义有重叠时请注意",
+                })
+    if substr_rows:
+        log(f"提示：发现 {len(substr_rows)} 组子串关键词对（如「低碳」与「超低碳」），详见词典诊断 Sheet。")
+
+    all_diag_rows = dup_rows + substr_rows
+    sheet_dict_diag = pd.DataFrame(all_diag_rows) if all_diag_rows else pd.DataFrame(
         columns=["关键词", "所在分类（全部）", "实际归入分类", "说明"]
     )
 
@@ -785,17 +807,20 @@ def run_analysis(
         log(f"并发模式：{_workers} 进程（多进程真并行，M4 Pro 等多核设备推荐）")
         from concurrent.futures import ProcessPoolExecutor, as_completed
         _jieba_userdict = jieba_userdict  # 传给 worker 初始化
+        # 正则模式下子进程不需要 all_dict_words（只用 keywords 列表），
+        # 避免将大型 set 序列化发送给每个 worker 进程
+        _worker_dict_words = set() if use_regex else all_dict_words
         executor = ProcessPoolExecutor(
             max_workers=_workers,
             initializer=_mp_worker_init,
-            initargs=(all_dict_words, _jieba_userdict, use_regex),
+            initargs=(_worker_dict_words, _jieba_userdict, use_regex),
         )
         try:
             future_map = {
                 executor.submit(
                     _process_one_file,
                     fpath, col_stkcd, col_year, text_columns,
-                    keywords, use_regex, all_dict_words,
+                    keywords, use_regex, _worker_dict_words,
                     stopwords, use_stopwords, export_sentences,
                     word_to_cat, agg_rules, None,  # 子进程不传 cancel_event
                 ): (i + 1, fpath)

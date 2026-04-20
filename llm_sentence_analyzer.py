@@ -69,6 +69,17 @@ _FORMAT_UNSUPPORTED_KEYWORDS = (
     "not supported",
 )
 
+# _normalize_result：LLM 返回的 JSON 中至少要包含其中一个维度字段才视为有效响应
+_EXPECTED_RESULT_KEYS = frozenset(
+    {"time_orientation", "voice", "sentence_type", "certainty", "quantitativeness", "tone"}
+)
+
+# 缓存命中校验：所有字段都存在时才使用缓存，防止格式不完整的旧缓存污染结果
+_REQUIRED_CACHE_KEYS = frozenset({
+    "LLM时间指向", "LLM语态", "LLM句子类型",
+    "LLM确定性", "LLM量化属性", "LLM语气语调", "LLM分析状态",
+})
+
 
 def _clean_json_string(text: str) -> str:
     text = re.sub(r"```json\s*", "", text)
@@ -243,22 +254,22 @@ class QwenSentenceAnalyzer:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
-    @staticmethod
-    def _load_cache(cache_path: str | None) -> dict[str, dict[str, Any]]:
+    def _load_cache(self, cache_path: str | None) -> dict[str, dict[str, Any]]:
         if not cache_path:
             return {}
         path = Path(cache_path)
-        if not path.is_file():
-            return {}
         try:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception:
+            # JSON 合法但不是 dict（如 list），返回空缓存
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            # 文件尚不存在属于预期情况（首次运行），静默返回
             return {}
-        # JSON 文件内容合法但不是 dict（如 list），同样返回空缓存
-        return {}
+        except Exception as exc:
+            # JSON 损坏、权限不足等非预期情况，给出明确警告
+            self._log(f"警告：LLM 缓存文件读取失败（{exc}），将以空缓存启动。")
+            return {}
 
     def _save_cache(self) -> None:
         if not self.config.cache_path:
@@ -281,6 +292,9 @@ class QwenSentenceAnalyzer:
         return default
 
     def _normalize_result(self, data: dict[str, Any]) -> dict[str, str]:
+        # 修复：空响应或缺失所有维度字段时返回失败，避免将全默认值误写为"成功"
+        if not isinstance(data, dict) or not any(k in data for k in _EXPECTED_RESULT_KEYS):
+            return _failed_result("LLM返回了空响应或格式不符合预期（缺少所有维度字段）")
         return {
             "LLM时间指向": self._normalize_value(data.get("time_orientation"), TIME_ORIENTATION_VALUES, "不明显"),
             "LLM语态": self._normalize_value(data.get("voice"), VOICE_VALUES, "不明显"),
@@ -349,12 +363,14 @@ class QwenSentenceAnalyzer:
                 # 修复：只有明确是"格式不支持"的 400 错误才降级；
                 # 其他异常（超时、限速等）直接抛出，由重试逻辑处理
                 if _is_format_unsupported_error(exc):
-                    self._log(
-                        f"提示：模型 {self.config.model} 不支持 json_schema 格式，"
-                        "已自动降级为 json_object 模式（后续请求同步切换）。"
-                    )
+                    # 修复：仅在首次触发降级时记录日志，防止多线程重复打印
                     with self._fallback_lock:
-                        self._use_json_object_fallback = True
+                        if not self._use_json_object_fallback:
+                            self._use_json_object_fallback = True
+                            self._log(
+                                f"提示：模型 {self.config.model} 不支持 json_schema 格式，"
+                                "已自动降级为 json_object 模式（后续请求同步切换）。"
+                            )
                     response = client.chat.completions.create(
                         response_format={"type": "json_object"},
                         **request_kwargs,
@@ -416,7 +432,9 @@ class QwenSentenceAnalyzer:
 
         for key in ordered_keys:
             cached = self._cache.get(key)
-            if isinstance(cached, dict) and cached.get("LLM分析状态") == "成功":
+            if (isinstance(cached, dict)
+                    and cached.get("LLM分析状态") == "成功"
+                    and _REQUIRED_CACHE_KEYS.issubset(cached.keys())):
                 result_by_key[key] = cached
                 cache_hits += 1
                 continue
