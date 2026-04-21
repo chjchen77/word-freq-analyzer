@@ -35,30 +35,34 @@ try:
 except ImportError:
     _HAS_TKINTER = False
     # 无图形环境时提供占位基类，使 GUI 类定义可正常解析（不可实例化）
+    # 用元类动态代理所有 tk.XXX / ttk.XXX 属性，避免逐一列举
     class _TkStub:  # noqa: E302
         def __init__(self, *a, **kw): pass
         def __init_subclass__(cls, **kw): pass
-    class tk:  # type: ignore[no-redef]  # noqa: E302
-        Toplevel = _TkStub; Frame = _TkStub; Text = _TkStub
-        Listbox = _TkStub; Label = _TkStub; Entry = _TkStub
-        Button = _TkStub; IntVar = _TkStub; StringVar = _TkStub
-        BooleanVar = _TkStub; Canvas = _TkStub; Menu = _TkStub
-        PanedWindow = _TkStub; OptionMenu = _TkStub
-        END = "end"; BOTH = "both"; LEFT = "left"; RIGHT = "right"
+        def __getattr__(self, name): return self
+        def __call__(self, *a, **kw): return self
+        def __iter__(self): return iter([])
+
+    class _MetaStub(type):
+        """元类：将任意属性访问都返回 _TkStub，使 class Foo(tk.Bar) 可正常继承。"""
+        def __getattr__(cls, name): return _TkStub
+
+    class tk(metaclass=_MetaStub):  # type: ignore[no-redef]  # noqa: E302
+        # tkinter 字符串常量（被 GUI 代码直接赋值使用）
+        END = "end"; INSERT = "insert"; SEL = "sel"
+        BOTH = "both"; LEFT = "left"; RIGHT = "right"; TOP = "top"; BOTTOM = "bottom"
         X = "x"; Y = "y"; W = "w"; E = "e"; N = "n"; S = "s"
-        WORD = "word"; HORIZONTAL = "horizontal"; VERTICAL = "vertical"
-        DISABLED = "disabled"; NORMAL = "normal"; ACTIVE = "active"
-        TOP = "top"; BOTTOM = "bottom"; CENTER = "center"; FLAT = "flat"
-        SUNKEN = "sunken"; RAISED = "raised"; GROOVE = "groove"
-        SINGLE = "single"; MULTIPLE = "multiple"; EXTENDED = "extended"
         NW = "nw"; NE = "ne"; SW = "sw"; SE = "se"
-    class ttk:  # type: ignore[no-redef]  # noqa: E302
-        Frame = _TkStub; Label = _TkStub; Button = _TkStub
-        Entry = _TkStub; Progressbar = _TkStub; Notebook = _TkStub
-        Combobox = _TkStub; Treeview = _TkStub; Scrollbar = _TkStub
-        Separator = _TkStub; Checkbutton = _TkStub; Spinbox = _TkStub
-        LabelFrame = _TkStub; Scale = _TkStub; PanedWindow = _TkStub
-        Style = _TkStub
+        WORD = "word"; CHAR = "char"
+        HORIZONTAL = "horizontal"; VERTICAL = "vertical"
+        DISABLED = "disabled"; NORMAL = "normal"; ACTIVE = "active"
+        CENTER = "center"; FLAT = "flat"; SUNKEN = "sunken"; RAISED = "raised"
+        SINGLE = "single"; MULTIPLE = "multiple"; EXTENDED = "extended"
+        GROOVE = "groove"; RIDGE = "ridge"; SOLID = "solid"
+
+    class ttk(metaclass=_MetaStub):  # type: ignore[no-redef]  # noqa: E302
+        pass
+
     class filedialog:  # type: ignore[no-redef]  # noqa: E302
         @staticmethod
         def askopenfilename(**kw): return ""
@@ -68,6 +72,7 @@ except ImportError:
         def askdirectory(**kw): return ""
         @staticmethod
         def asksaveasfilename(**kw): return ""
+
     class messagebox:  # type: ignore[no-redef]  # noqa: E302
         @staticmethod
         def showinfo(*a, **kw): pass
@@ -77,6 +82,7 @@ except ImportError:
         def showwarning(*a, **kw): pass
         @staticmethod
         def askyesno(*a, **kw): return False
+
     class simpledialog:  # type: ignore[no-redef]  # noqa: E302
         @staticmethod
         def askstring(*a, **kw): return None
@@ -669,8 +675,12 @@ def _process_chunk(
 
     # 关键词匹配
     if use_regex:
-        for kw in keywords:
-            df[kw] = text_series.str.count(f"(?i){re.escape(kw)}")
+        # 一次性构建所有关键词计数列，避免逐列 insert 导致 DataFrame 碎片化
+        kw_counts = {
+            kw: text_series.str.count(f"(?i){re.escape(kw)}")
+            for kw in keywords
+        }
+        df = pd.concat([df, pd.DataFrame(kw_counts, index=df.index)], axis=1)
     else:
         import jieba  # 延迟导入：仅 jieba 模式才加载词典
         sw = stopwords if use_stopwords else None
