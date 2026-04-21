@@ -425,9 +425,14 @@ def parse_year_column(series: pd.Series) -> pd.Series:
 
     candidates: list[pd.Series] = []
 
+    # 年报合理年份范围：1990–2030。
+    # 1900 是 Excel 零值日期（NaT → 1900-01-01）的常见误解析结果；
+    # 2099+ 通常来源于文件中的占位符日期，均应视为无效年份。
+    _YEAR_MIN, _YEAR_MAX = 1990, 2030
+
     # 策略 1：直接数值
     numeric = pd.to_numeric(series, errors="coerce")
-    valid_mask = numeric.between(1900, 2100)
+    valid_mask = numeric.between(_YEAR_MIN, _YEAR_MAX)
     candidates.append(numeric.where(valid_mask, 0).astype(int))
 
     # 策略 2：日期解析（v3.0: 移除废弃的 infer_datetime_format）
@@ -436,14 +441,14 @@ def parse_year_column(series: pd.Series) -> pd.Series:
     except (ValueError, TypeError):
         dates = pd.to_datetime(series, errors="coerce")
     years = dates.dt.year
-    # 与策略 1 保持一致：超范围年份（如 2200-01-01）置 0，不入库
-    valid_year_mask = years.between(1900, 2100)
+    valid_year_mask = years.between(_YEAR_MIN, _YEAR_MAX)
     candidates.append(years.where(valid_year_mask, 0).fillna(0).astype(int))
 
-    # 策略 3：正则提取 4 位年份
+    # 策略 3：正则提取 4 位年份，同样只保留合理范围内的值
     extracted = series.astype(str).str.extract(r"((?:19|20)\d{2})", expand=False)
     extracted_num = pd.to_numeric(extracted, errors="coerce")
-    candidates.append(extracted_num.fillna(0).astype(int))
+    valid_regex_mask = extracted_num.between(_YEAR_MIN, _YEAR_MAX)
+    candidates.append(extracted_num.where(valid_regex_mask, 0).fillna(0).astype(int))
 
     # 取有效年份（非 0）最多的策略；若均为 0 则返回全 0
     return max(candidates, key=lambda s: int((s > 0).sum()))
@@ -718,6 +723,9 @@ def run_analysis(
     if analyze_llm and not export_sentences:
         export_sentences = True
         log("提示：已自动启用导出命中句子，因为 LLM 句子分析依赖命中句子。")
+    # 命中句子无人工上限：Excel 行数由写出时的 MAX_EXCEL_ROWS 保护兜底。
+    # 之前设 20 万上限会导致大规模语料（>20 万命中）无法完整导出句子，已移除。
+    sentence_cap = 0
 
     # v3.0: 跨分类重复关键词警告（同一词在多个分类中只会归入最后一个分类）
     duplicates = dict_mgr.find_duplicates()
@@ -819,7 +827,8 @@ def run_analysis(
                 log(f"  {msg.split('  ', 1)[-1]}" if "  " in msg else f"  {msg}")
                 all_chunks.extend(chunks)
                 hit_sentences.extend(sents)
-                if len(hit_sentences) > MAX_SENTENCES:
+                if sentence_cap > 0 and len(hit_sentences) > sentence_cap:
+                    hit_sentences[:] = hit_sentences[:sentence_cap]
                     do_export_sentences = False
                     log("  命中句子已达上限，后续跳过提取。")
             except Exception as e:
@@ -864,8 +873,8 @@ def run_analysis(
                         with _sent_lock:
                             if not _sent_capped.is_set():
                                 hit_sentences.extend(sents)
-                                if len(hit_sentences) >= MAX_SENTENCES:
-                                    hit_sentences[:] = hit_sentences[:MAX_SENTENCES]
+                                if sentence_cap > 0 and len(hit_sentences) >= sentence_cap:
+                                    hit_sentences[:] = hit_sentences[:sentence_cap]
                                     _sent_capped.set()
                                     log("  命中句子已达上限，后续不再提取。")
                 except Exception as e:
@@ -1025,8 +1034,8 @@ def run_analysis(
         pd.DataFrame(explain_rows).to_excel(writer, sheet_name="分析说明", index=False)
         if df_sent is not None:
             df_sent_out = df_sent
-            if len(df_sent_out) > MAX_SENTENCES:
-                df_sent_out = df_sent_out.head(MAX_SENTENCES)
+            if sentence_cap > 0 and len(df_sent_out) > sentence_cap:
+                df_sent_out = df_sent_out.head(sentence_cap)
             if len(df_sent_out) > MAX_EXCEL_ROWS:
                 df_sent_out = df_sent_out.head(MAX_EXCEL_ROWS)
             # 加序号列，方便研究者交叉核查原文
