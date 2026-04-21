@@ -34,6 +34,52 @@ try:
     _HAS_TKINTER = True
 except ImportError:
     _HAS_TKINTER = False
+    # 无图形环境时提供占位基类，使 GUI 类定义可正常解析（不可实例化）
+    class _TkStub:  # noqa: E302
+        def __init__(self, *a, **kw): pass
+        def __init_subclass__(cls, **kw): pass
+    class tk:  # type: ignore[no-redef]  # noqa: E302
+        Toplevel = _TkStub; Frame = _TkStub; Text = _TkStub
+        Listbox = _TkStub; Label = _TkStub; Entry = _TkStub
+        Button = _TkStub; IntVar = _TkStub; StringVar = _TkStub
+        BooleanVar = _TkStub; Canvas = _TkStub; Menu = _TkStub
+        PanedWindow = _TkStub; OptionMenu = _TkStub
+        END = "end"; BOTH = "both"; LEFT = "left"; RIGHT = "right"
+        X = "x"; Y = "y"; W = "w"; E = "e"; N = "n"; S = "s"
+        WORD = "word"; HORIZONTAL = "horizontal"; VERTICAL = "vertical"
+        DISABLED = "disabled"; NORMAL = "normal"; ACTIVE = "active"
+        TOP = "top"; BOTTOM = "bottom"; CENTER = "center"; FLAT = "flat"
+        SUNKEN = "sunken"; RAISED = "raised"; GROOVE = "groove"
+        SINGLE = "single"; MULTIPLE = "multiple"; EXTENDED = "extended"
+        NW = "nw"; NE = "ne"; SW = "sw"; SE = "se"
+    class ttk:  # type: ignore[no-redef]  # noqa: E302
+        Frame = _TkStub; Label = _TkStub; Button = _TkStub
+        Entry = _TkStub; Progressbar = _TkStub; Notebook = _TkStub
+        Combobox = _TkStub; Treeview = _TkStub; Scrollbar = _TkStub
+        Separator = _TkStub; Checkbutton = _TkStub; Spinbox = _TkStub
+        LabelFrame = _TkStub; Scale = _TkStub; PanedWindow = _TkStub
+        Style = _TkStub
+    class filedialog:  # type: ignore[no-redef]  # noqa: E302
+        @staticmethod
+        def askopenfilename(**kw): return ""
+        @staticmethod
+        def askopenfilenames(**kw): return ()
+        @staticmethod
+        def askdirectory(**kw): return ""
+        @staticmethod
+        def asksaveasfilename(**kw): return ""
+    class messagebox:  # type: ignore[no-redef]  # noqa: E302
+        @staticmethod
+        def showinfo(*a, **kw): pass
+        @staticmethod
+        def showerror(*a, **kw): pass
+        @staticmethod
+        def showwarning(*a, **kw): pass
+        @staticmethod
+        def askyesno(*a, **kw): return False
+    class simpledialog:  # type: ignore[no-redef]  # noqa: E302
+        @staticmethod
+        def askstring(*a, **kw): return None
 from collections import Counter, defaultdict
 from pathlib import Path
 
