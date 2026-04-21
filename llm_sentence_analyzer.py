@@ -127,7 +127,7 @@ def _is_format_unsupported_error(exc: Exception) -> bool:
     return False
 
 
-@dataclass(slots=True)
+@dataclass
 class LLMAnalyzerConfig:
     api_key: str
     model: str = DEFAULT_MODEL
