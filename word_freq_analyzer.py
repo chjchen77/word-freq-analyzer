@@ -27,8 +27,13 @@ import os
 import re
 import sys
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+# tkinter 仅 GUI 模式需要；服务器/CLI 模式下可无 tkinter 正常运行核心功能
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, simpledialog
+    _HAS_TKINTER = True
+except ImportError:
+    _HAS_TKINTER = False
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -2248,6 +2253,11 @@ if __name__ == "__main__":
     # Windows PyInstaller multiprocessing 兼容
     import multiprocessing
     multiprocessing.freeze_support()
+
+    if not _HAS_TKINTER:
+        print("错误：当前环境没有安装 tkinter（图形界面库）。")
+        print("服务器/无头环境请使用命令行入口：python3 run_server.py --help")
+        sys.exit(1)
 
     # PyInstaller 打包兼容
     if getattr(sys, "frozen", False):
