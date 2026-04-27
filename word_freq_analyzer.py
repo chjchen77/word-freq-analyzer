@@ -760,6 +760,7 @@ def run_analysis(
     llm_max_workers: int = 4,
     llm_max_retries: int = 2,
     llm_cache_path: str | None = None,
+    llm_system_prompt: str = "",
     analysis_workers: int = 1,
     jieba_userdict: str = "",
     progress_cb=None,
@@ -800,23 +801,7 @@ def run_analysis(
                  "说明": "重复词：同一关键词出现在多个分类，仅计入最后一个分类"}
                 for w, cats in (duplicates or {}).items()]
 
-    # 子串关键词诊断：检测互为子串的关键词对，提示潜在重叠统计风险
-    substr_rows: list[dict] = []
-    kws_by_len = sorted(keywords, key=len)
-    for i, kw_short in enumerate(kws_by_len):
-        for kw_long in kws_by_len[i + 1:]:
-            if kw_short in kw_long:
-                cat_short = word_to_cat.get(kw_short, "")
-                substr_rows.append({
-                    "关键词": kw_short,
-                    "所在分类（全部）": cat_short,
-                    "实际归入分类": cat_short,
-                    "说明": f"子串警告：「{kw_short}」是「{kw_long}」的子串，正则模式下两者均独立计数，含义有重叠时请注意",
-                })
-    if substr_rows:
-        log(f"提示：发现 {len(substr_rows)} 组子串关键词对（如「低碳」与「超低碳」），详见词典诊断 Sheet。")
-
-    all_diag_rows = dup_rows + substr_rows
+    all_diag_rows = dup_rows
     sheet_dict_diag = pd.DataFrame(all_diag_rows) if all_diag_rows else pd.DataFrame(
         columns=["关键词", "所在分类（全部）", "实际归入分类", "说明"]
     )
@@ -865,12 +850,75 @@ def run_analysis(
     _sent_lock = threading.Lock()
     _sent_capped = threading.Event()  # 并发模式下句子上限信号
 
+    # ── 断点检查点（Checkpoint）──────────────────────────────────────────────
+    # 每处理 _CKPT_INTERVAL 个文件写一次断点；进程崩溃后可从断点续跑，不丢数据。
+    _CKPT_INTERVAL  = 5000
+    _ckpt_dir       = os.path.splitext(output_path)[0] + "_checkpoint"
+    _ckpt_chunks_path = os.path.join(_ckpt_dir, "chunks.csv")
+    _ckpt_sents_path  = os.path.join(_ckpt_dir, "sentences.csv")
+    _ckpt_done_path   = os.path.join(_ckpt_dir, "done_files.txt")
+
+    _resume_done_set: set[str] = set()
+    try:
+        if os.path.isfile(_ckpt_done_path):
+            with open(_ckpt_done_path, "r", encoding="utf-8") as _ckf:
+                _resume_done_set = {ln.strip() for ln in _ckf if ln.strip()}
+            log(f"⚡ 发现断点记录，已完成 {len(_resume_done_set)} 个文件，将从断点续跑。")
+            if os.path.isfile(_ckpt_chunks_path):
+                _ck_df = pd.read_csv(_ckpt_chunks_path, dtype={"公司代码": str, "年份": str})
+                for _kc in [c for c in _ck_df.columns if c not in ("公司代码", "年份")]:
+                    _ck_df[_kc] = pd.to_numeric(_ck_df[_kc], errors="coerce").fillna(0).astype(int)
+                all_chunks.append(_ck_df)
+                log(f"  已加载断点 chunks：{len(_ck_df)} 行")
+                del _ck_df
+            if os.path.isfile(_ckpt_sents_path):
+                _sk_df = pd.read_csv(_ckpt_sents_path)
+                hit_sentences.extend(_sk_df.to_dict("records"))
+                log(f"  已加载断点句子：{len(hit_sentences)} 条")
+                del _sk_df
+                if sentence_cap > 0 and len(hit_sentences) >= sentence_cap:
+                    hit_sentences[:] = hit_sentences[:sentence_cap]
+            files = [f for f in files if f not in _resume_done_set]
+            log(f"  剩余待处理：{len(files)} 个文件（原始共 {total_files} 个）")
+    except Exception as _ckpt_load_err:
+        log(f"⚠️  断点加载失败，将从头开始：{_ckpt_load_err}")
+        all_chunks.clear()
+        hit_sentences.clear()
+        _resume_done_set = set()
+
+    _already_done: int = len(_resume_done_set)
+    _ckpt_done_list: list[str] = list(_resume_done_set)
+
+    def _save_checkpoint_now(label: str = "") -> None:
+        """将当前进度（all_chunks / hit_sentences / 完成文件列表）原子写入断点目录。"""
+        try:
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            # 写 chunks（先 concat 再覆盖）
+            if all_chunks:
+                _tmp_c = pd.concat(all_chunks, ignore_index=True)
+                _tmp_c.to_csv(_ckpt_chunks_path, index=False, encoding="utf-8-sig")
+                del _tmp_c
+            # 写 sentences
+            if hit_sentences:
+                pd.DataFrame(hit_sentences).to_csv(
+                    _ckpt_sents_path, index=False, encoding="utf-8-sig"
+                )
+            # 原子写 done_files（先写 .tmp 再 rename，防止写到一半崩溃）
+            _tmp_done = _ckpt_done_path + ".tmp"
+            with open(_tmp_done, "w", encoding="utf-8") as _f2:
+                _f2.write("\n".join(_ckpt_done_list))
+            os.replace(_tmp_done, _ckpt_done_path)
+            _tag = f": {label}" if label else ""
+            log(f"  [断点已保存{_tag}] 已完成 {len(_ckpt_done_list)}/{total_files} 文件")
+        except Exception as _ce:
+            log(f"  [断点保存失败，不影响分析] {_ce}")
+
     _workers = max(1, int(analysis_workers))
 
     if _workers == 1:
         # ── 单线程顺序模式（兼容低配设备，日志顺序清晰）────────────────
         do_export_sentences = export_sentences
-        for idx, fpath in enumerate(files, 1):
+        for idx, fpath in enumerate(files, _already_done + 1):
             if is_cancelled():
                 log("用户已取消。")
                 break
@@ -894,6 +942,16 @@ def run_analysis(
                     log("  命中句子已达上限，后续跳过提取。")
             except Exception as e:
                 log(f"  跳过（错误）：{e}")
+            # 断点追踪：无论成功/报错都记录此文件已处理
+            _ckpt_done_list.append(fpath)
+            if len(_ckpt_done_list) % _CKPT_INTERVAL == 0:
+                _save_checkpoint_now(f"{len(_ckpt_done_list)}/{total_files}")
+                # 压缩 all_chunks → 单 DataFrame，减少下次 concat 开销
+                if len(all_chunks) > 1:
+                    _compacted = pd.concat(all_chunks, ignore_index=True)
+                    all_chunks.clear()
+                    all_chunks.append(_compacted)
+                    del _compacted
             gc.collect()
             if progress_cb:
                 progress_cb(idx, total_files)
@@ -926,9 +984,10 @@ def run_analysis(
             for future in as_completed(future_map):
                 idx, fpath = future_map[future]
                 completed += 1
+                _disp = completed + _already_done  # 显示时加上已跳过的断点文件数
                 try:
                     chunks, sents, msg = future.result()
-                    log(f"[{completed}/{total_files}] {msg}")
+                    log(f"[{_disp}/{total_files}] {msg}")
                     all_chunks.extend(chunks)
                     if sents and not _sent_capped.is_set():
                         with _sent_lock:
@@ -939,16 +998,29 @@ def run_analysis(
                                     _sent_capped.set()
                                     log("  命中句子已达上限，后续不再提取。")
                 except Exception as e:
-                    log(f"[{completed}/{total_files}] 跳过（错误）：{e}")
+                    log(f"[{_disp}/{total_files}] 跳过（错误）：{e}")
+                # 断点追踪（主线程串行处理 future，无需额外加锁）
+                _ckpt_done_list.append(fpath)
+                if len(_ckpt_done_list) % _CKPT_INTERVAL == 0:
+                    _save_checkpoint_now(f"{len(_ckpt_done_list)}/{total_files}")
+                    # 压缩 all_chunks，减少下次 concat 开销
+                    if len(all_chunks) > 1:
+                        _compacted = pd.concat(all_chunks, ignore_index=True)
+                        all_chunks.clear()
+                        all_chunks.append(_compacted)
+                        del _compacted
                 gc.collect()
                 if progress_cb:
-                    progress_cb(completed, total_files)
+                    progress_cb(_disp, total_files)
                 if is_cancelled():
                     executor.shutdown(wait=False, cancel_futures=True)
                     log("用户已取消，等待当前批次完成…")
                     break
         finally:
             executor.shutdown(wait=True)
+
+    # 最终断点：全部文件处理完毕（或用户取消）后落盘一次，保证 100% 数据可恢复
+    _save_checkpoint_now("全部文件处理完毕" if not is_cancelled() else "用户取消时保存")
 
     if is_cancelled():
         raise ValueError("分析已被用户取消。")
@@ -1017,10 +1089,20 @@ def run_analysis(
     del panel
     gc.collect()
 
-    # ---- 写入 Excel ----
-    log("正在写入 Excel…")
+    # ---- 构建句子 DataFrame（尽早转换并释放 list 内存）----
+    df_sent = None
+    sheet4_rows = 0
+    if hit_sentences:
+        df_sent = pd.DataFrame(hit_sentences)
+        del hit_sentences  # 立即释放原始 list，节省 1-2 GB
+        gc.collect()
+        _sort_cols = [c for c in ["公司代码", "年份", "分类", "命中关键词", "命中句子"]
+                      if c in df_sent.columns]
+        if _sort_cols:
+            df_sent = df_sent.sort_values(_sort_cols, kind="stable").reset_index(drop=True)
+        sheet4_rows = len(df_sent)
 
-    # v3.0: Excel 行数上限保护 — 先保存完整 CSV，再截断写 Excel
+    # ---- Excel 行数上限保护 — 先保存完整 CSV，再截断写 Excel ----
     truncated = False
     if len(sheet1) > MAX_EXCEL_ROWS or len(sheet2) > MAX_EXCEL_ROWS:
         truncated = True
@@ -1031,8 +1113,6 @@ def run_analysis(
         sheet2.to_csv(os.path.join(csv_dir, "关键词明细.csv"), index=False, encoding="utf-8-sig")
         sheet3.to_csv(os.path.join(csv_dir, "分类汇总.csv"), index=False, encoding="utf-8-sig")
         log(f"完整数据已保存至：{csv_dir}")
-
-    # 截断后写 Excel
     if len(sheet1) > MAX_EXCEL_ROWS:
         log(f"警告：Sheet1 共 {len(sheet1)} 行，Excel 上限 {MAX_EXCEL_ROWS}，Excel 中已截断。")
         sheet1 = sheet1.head(MAX_EXCEL_ROWS)
@@ -1040,87 +1120,308 @@ def run_analysis(
         log(f"警告：Sheet2 共 {len(sheet2)} 行，Excel 上限 {MAX_EXCEL_ROWS}，Excel 中已截断。")
         sheet2 = sheet2.head(MAX_EXCEL_ROWS)
 
-    df_sent = None
-    sheet4_rows = 0
-    if hit_sentences:
-        df_sent = pd.DataFrame(hit_sentences)
-        # 排序：并发模式下文件完成顺序不确定，排序保证多次运行序号可复现。
-        # 加入「命中句子」确保同关键词下多句之间也有确定顺序；
-        # kind="stable" 保证完全相同的记录在原始 DataFrame 中的相对顺序不变。
-        _sort_cols = [c for c in ["公司代码", "年份", "分类", "命中关键词", "命中句子"]
-                      if c in df_sent.columns]
-        if _sort_cols:
-            df_sent = df_sent.sort_values(_sort_cols, kind="stable").reset_index(drop=True)
-        sheet4_rows = len(df_sent)
-
-        if analyze_llm:
-            log("正在准备 LLM 句子分析...")
-            if llm_cache_path is None:
-                llm_cache_path = os.path.splitext(output_path)[0] + "_llm_cache.json"
-            from llm_sentence_analyzer import LLMAnalyzerConfig, apply_llm_sentence_analysis
-            llm_cfg = LLMAnalyzerConfig.from_inputs(
-                api_key=llm_api_key,
-                model=llm_model,
-                base_url=llm_base_url,
-                max_workers=llm_max_workers,
-                max_sentences=llm_max_sentences,
-                max_retries=llm_max_retries,
-                cache_path=llm_cache_path,
-            )
-            log(
-                f"LLM 配置：模型 {llm_cfg.model}，唯一句子上限 {llm_cfg.max_sentences}，"
-                f"缓存文件 {os.path.basename(llm_cfg.cache_path) if llm_cfg.cache_path else '未启用'}"
-            )
-            df_sent = apply_llm_sentence_analysis(
-                df_sent,
-                llm_cfg,
-                log_cb=log,
-                cancel_event=cancel_event,
-            )
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    # ---- 先写词频结果 Excel（LLM 开始前落盘，防止 OOM 崩溃导致数据全丢）----
+    log("正在写入词频结果 Excel…")
+    _explain_rows = [
+        {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
+        {"项目": "Sheet4 命中句子", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，Sheet1计N次，但Sheet4仅记录该句子一次。"},
+        {"项目": "分类占比列（_占比）", "说明": "= 该分类出现次数 / 该行所有分类出现次数之和。这是分类构成比，不是传统TF词频（词频/文档总词数）。"},
+        {"项目": "LLM分析维度", "说明": "LLM时间指向/语态/句子类型/确定性/量化属性/语气均基于关键词所在句子的语义判断，temperature=0确保可复现。"},
+        {"项目": "重复关键词处理", "说明": "同一关键词出现在多个分类时，仅归入词典中最后定义的分类。详见【词典诊断】sheet。"},
+        {"项目": "句子提取规则", "说明": "以。！？为句子边界切分；连续空行视为段落边界；单个换行视为PDF断行删除。最短句子长度=8字。"},
+    ]
+    # 第一步：只写主表格（不含命中句子），用 xlsxwriter constant_memory 逐行落盘
+    # 命中句子单独写入 _sentences.xlsx，避免大文件与大 DataFrame 同时驻留内存
+    with pd.ExcelWriter(output_path, engine="xlsxwriter",
+                        engine_kwargs={"options": {"constant_memory": True}}) as writer:
         sheet1.to_excel(writer, sheet_name="公司年份分类统计", index=False)
         sheet2.to_excel(writer, sheet_name="关键词明细", index=False)
         sheet3.to_excel(writer, sheet_name="分类汇总", index=False)
         sheet_dict_diag.to_excel(writer, sheet_name="词典诊断", index=False)
-        # 分析说明 sheet
-        explain_rows = [
-            {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
-            {"项目": "Sheet4 命中句子", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，Sheet1计N次，但Sheet4仅记录该句子一次。"},
-            {"项目": "分类占比列（_占比）", "说明": "= 该分类出现次数 / 该行所有分类出现次数之和。这是分类构成比，不是传统TF词频（词频/文档总词数）。"},
-            {"项目": "LLM分析维度", "说明": "LLM时间指向/语态/句子类型/确定性/量化属性/语气均基于关键词所在句子的语义判断，temperature=0确保可复现。"},
-            {"项目": "重复关键词处理", "说明": "同一关键词出现在多个分类时，仅归入词典中最后定义的分类。详见【词典诊断】sheet。"},
-            {"项目": "句子提取规则", "说明": "以。！？为句子边界切分；连续空行视为段落边界；单个换行视为PDF断行删除。最短句子长度=8字。"},
-        ]
-        pd.DataFrame(explain_rows).to_excel(writer, sheet_name="分析说明", index=False)
-        if df_sent is not None:
-            df_sent_out = df_sent
-            if sentence_cap > 0 and len(df_sent_out) > sentence_cap:
-                df_sent_out = df_sent_out.head(sentence_cap)
-            if len(df_sent_out) > MAX_EXCEL_ROWS:
-                df_sent_out = df_sent_out.head(MAX_EXCEL_ROWS)
-            # 加序号列，方便研究者交叉核查原文
-            df_sent_out.insert(0, "序号", range(1, len(df_sent_out) + 1))
-            df_sent_out.to_excel(writer, sheet_name="命中句子", index=False)
+        pd.DataFrame(_explain_rows).to_excel(writer, sheet_name="分析说明", index=False)
+    log(f"词频结果已保存至：{output_path}")
 
-    n_companies = sheet1["公司代码"].nunique()
-    year_min = int(sheet1["年份"].min()) if len(sheet1) > 0 else 0
-    year_max = int(sheet1["年份"].max()) if len(sheet1) > 0 else 0
-    log(f"完成！{len(sheet1)} 条面板记录，{n_companies} 家公司，年份 {year_min}-{year_max}")
-    log(f"Sheet1: 公司×年份 分类统计 ({len(sheet1)} 行)")
-    log(f"Sheet2: 关键词明细 ({len(sheet2)} 行)")
-    log(f"Sheet3: 分类汇总 ({len(sheet3)} 行)")
-    if hit_sentences:
-        log(f"Sheet4: 命中句子 ({sheet4_rows} 条)")
-    if df_sent is not None and analyze_llm and "LLM分析状态" in df_sent.columns:
-        llm_status = df_sent["LLM分析状态"].value_counts(dropna=False).to_dict()
-        status_text = ", ".join(f"{k}={v}" for k, v in llm_status.items())
+    # 词频 Excel 已落盘 → 断点目录使命完成，清理掉节省磁盘空间
+    try:
+        import shutil as _shutil
+        if os.path.isdir(_ckpt_dir):
+            _shutil.rmtree(_ckpt_dir)
+            log("断点目录已清理。")
+    except Exception as _ce:
+        log(f"断点目录清理失败（不影响结果）：{_ce}")
+
+    # ---- 立即释放主表格 DataFrame，为后续句子写入和 LLM 腾出内存 ----
+    _n_sheet1 = len(sheet1)
+    _n_companies = sheet1["公司代码"].nunique() if _n_sheet1 > 0 else 0
+    _year_min = int(sheet1["年份"].min()) if _n_sheet1 > 0 else 0
+    _year_max = int(sheet1["年份"].max()) if _n_sheet1 > 0 else 0
+    _n_sheet2 = len(sheet2)
+    _n_sheet3 = len(sheet3)
+    del sheet1, sheet2, sheet3, sheet_dict_diag
+    gc.collect()
+
+    # 第二步：写命中句子（不含 LLM 列）到独立文件，LLM 完成后覆盖写入
+    # 独立文件 = 永远不需要 openpyxl 加载大 xlsx，彻底避免 append OOM
+    _sent_path = os.path.splitext(output_path)[0] + "_sentences.xlsx"
+    _llm_status_dict = None  # 初始化，避免 df_sent 为 None 时末尾日志 NameError
+    _llm_conf_dict = None
+    if df_sent is not None:
+        # 【关键保障】先把全量句子存成完整 CSV，防止 OOM 崩溃后数据丢失
+        # 无论后续 LLM/Excel 写入是否成功，这份 CSV 始终完整保留
+        _sent_full_csv = os.path.splitext(output_path)[0] + "_sentences_full.csv"
+        log(f"正在保存全量命中句子 CSV（共 {len(df_sent)} 条）…")
+        df_sent.to_csv(_sent_full_csv, index=False, encoding="utf-8-sig")
+        log(f"全量句子已保存至：{_sent_full_csv}（即使后续崩溃数据也不丢失）")
+
+        _n_pre = min(MAX_EXCEL_ROWS, len(df_sent))
+        _df_pre = df_sent.head(_n_pre).copy()
+        _df_pre.insert(0, "序号", range(1, _n_pre + 1))
+        with pd.ExcelWriter(_sent_path, engine="xlsxwriter",
+                            engine_kwargs={"options": {"constant_memory": True}}) as writer:
+            _df_pre.to_excel(writer, sheet_name="命中句子", index=False)
+        del _df_pre
+        gc.collect()
+        log(f"命中句子已保存至：{_sent_path}（LLM 分析完成后将更新）")
+
+    # ---- LLM 句子分析（分批处理，每批 10 万条，避免 OOM）----
+    _LLM_BATCH_SIZE = 10_000
+    if df_sent is not None and analyze_llm:
+        log("正在准备 LLM 句子分析...")
+        if llm_cache_path is None:
+            llm_cache_path = os.path.splitext(output_path)[0] + "_llm_cache.json"
+        from llm_sentence_analyzer import LLMAnalyzerConfig, apply_llm_sentence_analysis
+        llm_cfg = LLMAnalyzerConfig.from_inputs(
+            api_key=llm_api_key,
+            model=llm_model,
+            base_url=llm_base_url,
+            max_workers=llm_max_workers,
+            max_sentences=llm_max_sentences,
+            max_retries=llm_max_retries,
+            cache_path=llm_cache_path,
+            system_prompt=llm_system_prompt or None,
+        )
+        log(
+            f"LLM 配置：模型 {llm_cfg.model}，唯一句子上限 {llm_cfg.max_sentences}，"
+            f"缓存文件 {os.path.basename(llm_cfg.cache_path) if llm_cfg.cache_path else '未启用'}"
+            + ("，使用自定义提示词" if llm_cfg.system_prompt else "")
+        )
+        n_total = len(df_sent)
+        n_batches = max(1, (n_total + _LLM_BATCH_SIZE - 1) // _LLM_BATCH_SIZE)
+        log(f"共 {n_total} 条句子，分 {n_batches} 批处理（每批最多 {_LLM_BATCH_SIZE} 条）")
+        result_parts: list[pd.DataFrame] = []
+        for _bi in range(n_batches):
+            if cancel_event and cancel_event.is_set():
+                break
+            _s = _bi * _LLM_BATCH_SIZE
+            _e = min(_s + _LLM_BATCH_SIZE, n_total)
+            log(f"  第 {_bi + 1}/{n_batches} 批：行 {_s + 1}–{_e}")
+            _batch = df_sent.iloc[_s:_e].copy()
+            _batch_result = apply_llm_sentence_analysis(
+                _batch, llm_cfg, log_cb=log, cancel_event=cancel_event,
+            )
+            result_parts.append(_batch_result)
+            del _batch
+            gc.collect()
+        if result_parts:
+            # 先释放旧 df_sent（无 LLM 列）再 concat，避免：旧+result_parts+新 三份同时驻留
+            del df_sent
+            gc.collect()
+            df_sent = pd.concat(result_parts, ignore_index=True)
+            del result_parts
+            gc.collect()
+        else:
+            # 未完成任何批次（立即取消），保留原始 df_sent（无 LLM 列）
+            del result_parts
+            gc.collect()
+
+    # 第三步：将带 LLM 列的命中句子覆盖写入独立文件（xlsxwriter constant_memory）
+    # 绝不用 openpyxl mode='a'——那会把几百 MB 的 xlsx 全部加载进内存
+    if df_sent is not None:
+        # 超过 Excel 行上限时，先导出完整 CSV 防止数据丢失
+        if len(df_sent) > MAX_EXCEL_ROWS:
+            _sent_csv_path = os.path.splitext(output_path)[0] + "_sentences_full.csv"
+            log(f"命中句子共 {len(df_sent)} 条，超过 Excel 行上限 {MAX_EXCEL_ROWS}，"
+                f"正在导出完整 CSV 备份（流式写盘）…")
+            df_sent.to_csv(_sent_csv_path, index=False, encoding="utf-8-sig")
+            log(f"完整命中句子 CSV 已保存至：{_sent_csv_path}")
+        _sent_out = df_sent
+        if sentence_cap > 0 and len(_sent_out) > sentence_cap:
+            _sent_out = _sent_out.head(sentence_cap).copy()
+        elif len(_sent_out) > MAX_EXCEL_ROWS:
+            _sent_out = _sent_out.head(MAX_EXCEL_ROWS).copy()
+        else:
+            _sent_out = _sent_out.copy()
+        # 在 del df_sent 之前提取 LLM 统计（后面不能再访问 df_sent）
+        _llm_status_dict = None
+        _llm_conf_dict = None
+        if analyze_llm and "LLM分析状态" in _sent_out.columns:
+            _llm_status_dict = _sent_out["LLM分析状态"].value_counts(dropna=False).to_dict()
+            if "LLM置信度" in _sent_out.columns:
+                _llm_conf_dict = _sent_out[_sent_out["LLM分析状态"] == "成功"]["LLM置信度"].value_counts(dropna=False).to_dict()
+        del df_sent  # 释放原始引用，GC 后内存降至仅 _sent_out
+        gc.collect()
+        _sent_out.insert(0, "序号", range(1, len(_sent_out) + 1))
+        log("正在将命中句子写入 Excel…")
+        with pd.ExcelWriter(_sent_path, engine="xlsxwriter",
+                            engine_kwargs={"options": {"constant_memory": True}}) as writer:
+            _sent_out.to_excel(writer, sheet_name="命中句子", index=False)
+        log(f"命中句子已写入：{_sent_path}（{len(_sent_out)} 条）")
+        del _sent_out
+        gc.collect()
+
+    log(f"完成！{_n_sheet1} 条面板记录，{_n_companies} 家公司，年份 {_year_min}-{_year_max}")
+    log(f"Sheet1: 公司×年份 分类统计 ({_n_sheet1} 行)")
+    log(f"Sheet2: 关键词明细 ({_n_sheet2} 行)")
+    log(f"Sheet3: 分类汇总 ({_n_sheet3} 行)")
+    if sheet4_rows:
+        log(f"Sheet4: 命中句子 ({sheet4_rows} 条，详见 {os.path.basename(_sent_path)})")
+    if _llm_status_dict is not None:
+        status_text = ", ".join(f"{k}={v}" for k, v in _llm_status_dict.items())
         log(f"LLM 句子分析状态：{status_text}")
-        if "LLM置信度" in df_sent.columns:
-            conf_dist = df_sent[df_sent["LLM分析状态"] == "成功"]["LLM置信度"].value_counts(dropna=False).to_dict()
-            conf_text = ", ".join(f"{k}={v}" for k, v in conf_dist.items())
+        if _llm_conf_dict is not None:
+            conf_text = ", ".join(f"{k}={v}" for k, v in _llm_conf_dict.items())
             log(f"LLM 置信度分布：{conf_text}")
-    log(f"结果已保存至：{output_path}")
+    log(f"词频结果：{output_path}")
+    log(f"命中句子：{_sent_path}")
+
+
+# ============================================================
+# LLM 续跑入口（词频已完成，只跑 LLM）
+# ============================================================
+
+def run_llm_analysis_only(
+    sentences_source: str,
+    output_path: str,
+    *,
+    llm_api_key: str = "",
+    llm_model: str = "qwen-plus",
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    llm_max_sentences: int = 0,
+    llm_max_workers: int = 8,
+    llm_max_retries: int = 2,
+    llm_cache_path: str | None = None,
+    llm_system_prompt: str = "",
+    log_cb=None,
+    cancel_event: threading.Event | None = None,
+):
+    """跳过词频阶段，直接对已有命中句子文件续跑 LLM 分析。
+
+    典型用法：词频分析已完成（result.xlsx / result_sentences.xlsx 已落盘），
+    但 LLM 因限流/OOM/网络中断而失败，无需重新跑 3-4 小时的词频，
+    直接读取已有句子文件，结合 llm_cache.json（已分析的跳过），续跑剩余部分。
+
+    sentences_source: 命中句子文件路径，优先传 _sentences_full.csv（完整数据），
+                      次选 _sentences.xlsx（最多 MAX_EXCEL_ROWS 行）。
+    output_path:      词频结果 xlsx 路径（用于推算 _sent_path 等输出路径）。
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    def is_cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    # ---- 读取命中句子 ----
+    log(f"[LLM续跑] 正在读取命中句子：{sentences_source}…")
+    src_path = Path(sentences_source)
+    if not src_path.exists():
+        raise FileNotFoundError(f"命中句子文件不存在：{sentences_source}")
+
+    ext = src_path.suffix.lower()
+    if ext == ".csv":
+        df_sent = pd.read_csv(sentences_source, encoding="utf-8-sig", dtype=str)
+    elif ext in (".xlsx", ".xls"):
+        df_sent = pd.read_excel(sentences_source, engine="openpyxl", dtype=str)
+    else:
+        raise ValueError(f"不支持的格式：{ext}（仅支持 .csv / .xlsx / .xls）")
+
+    # 年份列转回整数（CSV 读进来是字符串）
+    if "年份" in df_sent.columns:
+        df_sent["年份"] = pd.to_numeric(df_sent["年份"], errors="coerce").fillna(0).astype(int)
+
+    # 去掉序号列（写出时重新生成），去掉旧 LLM 列（将被重新分析覆盖）
+    _drop_cols = ["序号"] + [c for c in df_sent.columns if c.startswith("LLM")]
+    df_sent = df_sent.drop(columns=[c for c in _drop_cols if c in df_sent.columns])
+
+    log(f"[LLM续跑] 共读取 {len(df_sent)} 条命中句子。")
+    gc.collect()
+
+    # ---- LLM 配置 ----
+    if llm_cache_path is None:
+        llm_cache_path = os.path.splitext(output_path)[0] + "_llm_cache.json"
+    from llm_sentence_analyzer import LLMAnalyzerConfig, apply_llm_sentence_analysis
+    llm_cfg = LLMAnalyzerConfig.from_inputs(
+        api_key=llm_api_key,
+        model=llm_model,
+        base_url=llm_base_url,
+        max_workers=llm_max_workers,
+        max_sentences=llm_max_sentences,
+        max_retries=llm_max_retries,
+        cache_path=llm_cache_path,
+        system_prompt=llm_system_prompt or None,
+    )
+    limit_desc = "无上限" if llm_cfg.max_sentences <= 0 else str(llm_cfg.max_sentences)
+    log(
+        f"[LLM续跑] 模型 {llm_cfg.model}，上限 {limit_desc}，"
+        f"线程 {llm_cfg.max_workers}，"
+        f"缓存 {os.path.basename(llm_cfg.cache_path) if llm_cfg.cache_path else '未启用'}"
+    )
+
+    # ---- 分批 LLM 分析 ----
+    _LLM_BATCH_SIZE = 10_000
+    n_total = len(df_sent)
+    n_batches = max(1, (n_total + _LLM_BATCH_SIZE - 1) // _LLM_BATCH_SIZE)
+    log(f"[LLM续跑] 共 {n_total} 条句子，分 {n_batches} 批（每批最多 {_LLM_BATCH_SIZE} 条）")
+
+    result_parts: list[pd.DataFrame] = []
+    for _bi in range(n_batches):
+        if is_cancelled():
+            log("[LLM续跑] 用户已取消。")
+            break
+        _s = _bi * _LLM_BATCH_SIZE
+        _e = min(_s + _LLM_BATCH_SIZE, n_total)
+        log(f"  第 {_bi + 1}/{n_batches} 批：行 {_s + 1}–{_e}")
+        _batch = df_sent.iloc[_s:_e].copy()
+        _batch_result = apply_llm_sentence_analysis(
+            _batch, llm_cfg, log_cb=log, cancel_event=cancel_event,
+        )
+        result_parts.append(_batch_result)
+        del _batch
+        gc.collect()
+
+    if result_parts:
+        del df_sent
+        gc.collect()
+        df_sent = pd.concat(result_parts, ignore_index=True)
+        del result_parts
+        gc.collect()
+    else:
+        del result_parts
+        gc.collect()
+
+    # ---- 写出结果 ----
+    _sent_path = os.path.splitext(output_path)[0] + "_sentences.xlsx"
+
+    # 超过 Excel 行上限时先导出完整 CSV，防止数据截断丢失
+    if len(df_sent) > MAX_EXCEL_ROWS:
+        _sent_csv_path = os.path.splitext(output_path)[0] + "_sentences_full.csv"
+        log(f"[LLM续跑] 句子共 {len(df_sent)} 条，超 Excel 上限，导出完整 CSV…")
+        df_sent.to_csv(_sent_csv_path, index=False, encoding="utf-8-sig")
+        log(f"[LLM续跑] 完整 CSV 已保存至：{_sent_csv_path}")
+
+    _sent_out = (df_sent.head(MAX_EXCEL_ROWS).copy()
+                 if len(df_sent) > MAX_EXCEL_ROWS else df_sent.copy())
+    del df_sent
+    gc.collect()
+
+    _sent_out.insert(0, "序号", range(1, len(_sent_out) + 1))
+    log("[LLM续跑] 正在写入命中句子 Excel…")
+    with pd.ExcelWriter(_sent_path, engine="xlsxwriter",
+                        engine_kwargs={"options": {"constant_memory": True}}) as writer:
+        _sent_out.to_excel(writer, sheet_name="命中句子", index=False)
+    log(f"[LLM续跑] 完成！命中句子已写入：{_sent_path}（{len(_sent_out)} 条）")
+    del _sent_out
+    gc.collect()
 
 
 # ============================================================
@@ -1201,6 +1502,7 @@ class WordFreqApp(tk.Tk):
         self._llm_api_key_entry = None
         self._llm_cache_entry = None
         self._llm_cache_btn = None
+        self._llm_prompt_text = None   # tk.Text 控件，保存自定义系统提示词
         self.jieba_dict_path = tk.StringVar()
         self._word_search_var = tk.StringVar()
         self._word_search_var.trace_add("write", self._on_word_search)
@@ -1613,6 +1915,34 @@ class WordFreqApp(tk.Tk):
         ttk.Label(cache_row,
                   text="不勾选则与输出文件同目录，重复运行自动跳过已分析句子",
                   foreground="#666666").pack(side="left")
+
+        # ── 自定义系统提示词 ──────────────────────────────────────────
+        frm_prompt = ttk.LabelFrame(frm_llm, text="自定义系统提示词（可选，留空使用内置模板）")
+        frm_prompt.pack(fill="x", padx=8, pady=(0, 8))
+
+        # 顶部操作栏
+        prompt_toolbar = ttk.Frame(frm_prompt)
+        prompt_toolbar.pack(fill="x", padx=6, pady=(4, 0))
+        ttk.Label(
+            prompt_toolbar,
+            text="修改后将替换内置分析维度说明（格式要求见内置模板）；不修改则留空即可。",
+            foreground="#666666",
+        ).pack(side="left")
+        ttk.Button(
+            prompt_toolbar,
+            text="重置为默认",
+            command=self._reset_llm_prompt,
+        ).pack(side="right", padx=(4, 0))
+
+        # 可滚动文本框
+        from tkinter import scrolledtext as _st
+        self._llm_prompt_text = _st.ScrolledText(
+            frm_prompt, height=10, wrap="word", font=("Courier", 10),
+            undo=True,
+        )
+        self._llm_prompt_text.pack(fill="x", padx=6, pady=(4, 6))
+        # 默认留空（留空 = 使用内置提示词）；用户点"重置为默认"可查看/恢复模板
+        self._llm_prompt_text.insert("1.0", "")
 
         # ── jieba 自定义词典 ──────────────────────────────────────────
         frm_jieba = ttk.LabelFrame(tab, text="jieba 用户词典（仅 jieba 模式，可选）")
@@ -2060,6 +2390,18 @@ class WordFreqApp(tk.Tk):
         if self._llm_cache_btn:
             self._llm_cache_btn.configure(state=state)
 
+    def _reset_llm_prompt(self):
+        """将自定义提示词文本框重置为内置默认模板，方便用户查看并在此基础上修改。"""
+        if self._llm_prompt_text is None:
+            return
+        try:
+            from llm_sentence_analyzer import QwenSentenceAnalyzer
+            default = QwenSentenceAnalyzer.SYSTEM_PROMPT
+        except Exception:
+            default = "（无法读取默认提示词，请检查 llm_sentence_analyzer.py 是否存在）"
+        self._llm_prompt_text.delete("1.0", "end")
+        self._llm_prompt_text.insert("1.0", default)
+
     def _choose_llm_cache_path(self):
         path = filedialog.asksaveasfilename(
             title="选择 LLM 缓存文件保存位置",
@@ -2276,6 +2618,10 @@ class WordFreqApp(tk.Tk):
             llm_max_workers=llm_max_workers,
             llm_max_retries=llm_max_retries,
             llm_cache_path=llm_cache_path,
+            llm_system_prompt=(
+                self._llm_prompt_text.get("1.0", "end-1c").strip()
+                if self._llm_prompt_text else ""
+            ),
             analysis_workers=analysis_workers_val,
             jieba_userdict=self.jieba_dict_path.get(),
             progress_cb=self._update_progress,

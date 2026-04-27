@@ -205,6 +205,31 @@ def _parse_args() -> argparse.Namespace:
         metavar="FILE",
         help="LLM 缓存文件路径（默认：与 --output 同目录下的 llm_cache.json）",
     )
+    g.add_argument(
+        "--llm-system-prompt-file",
+        default="",
+        metavar="FILE",
+        help=(
+            "自定义 LLM 系统提示词文件路径（UTF-8 纯文本）。\n"
+            "不传则使用内置默认提示词（推荐大多数情况）。\n"
+            "注意：修改提示词后，已缓存的结果不会被重新分析；\n"
+            "如需全量重跑请删除或重命名 llm_cache.json。"
+        ),
+    )
+
+    # ── LLM 续跑模式（词频已完成，只跑 LLM）────────────────────────────────
+    p.add_argument(
+        "--resume-sentences",
+        default="",
+        metavar="FILE",
+        help=(
+            "【LLM 续跑模式】跳过词频分析，直接对指定命中句子文件运行 LLM 分析。\n"
+            "词频已完成但 LLM 因限流/崩溃失败时使用。\n"
+            "优先传 result_sentences_full.csv（完整），次选 result_sentences.xlsx。\n"
+            "已在 llm_cache.json 中的句子会自动跳过，无需重复分析。\n"
+            "示例：--resume-sentences /mnt/fastdata/output/result_sentences.xlsx"
+        ),
+    )
 
     # ── 日志 ────────────────────────────────────────────────────────────────
     p.add_argument(
@@ -223,6 +248,16 @@ def main() -> int:
         sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
 
     args = _parse_args()
+
+    # ── 读取自定义系统提示词（可选）────────────────────────────────────────────
+    llm_system_prompt: str = ""
+    _prompt_file = getattr(args, "llm_system_prompt_file", "").strip()
+    if _prompt_file:
+        try:
+            llm_system_prompt = Path(_prompt_file).read_text(encoding="utf-8").strip()
+        except Exception as _e:
+            print(f"[错误] 读取自定义提示词文件失败：{_e}", flush=True)
+            return 2
 
     # ── 推断 LLM 缓存路径 ────────────────────────────────────────────────────
     llm_cache_path: str | None = None
@@ -244,6 +279,66 @@ def main() -> int:
     log_file = args.log_file.strip() or None
     logger = _setup_logger(log_file)
     log_cb = _make_log_cb(logger)
+
+    # ── LLM 续跑模式：跳过词频，只跑 LLM ─────────────────────────────────────
+    resume_sentences = args.resume_sentences.strip()
+    if resume_sentences:
+        if not resolved_api_key:
+            log_cb("[错误] LLM 续跑模式需要提供 --llm-api-key。")
+            return 2
+        if not os.path.isfile(resume_sentences):
+            log_cb(f"[错误] 命中句子文件不存在：{resume_sentences}")
+            return 2
+
+        log_cb("=" * 60)
+        log_cb("中文文本词频统计分析工具 — LLM 续跑模式")
+        log_cb("（跳过词频分析，直接对已有命中句子续跑 LLM）")
+        log_cb("=" * 60)
+        log_cb(f"命中句子来源：{resume_sentences}")
+        log_cb(f"输出路径：{args.output}")
+        log_cb(f"LLM 模型：{args.llm_model} | 并发：{args.llm_workers} | 缓存：{llm_cache_path}")
+        log_cb("-" * 60)
+
+        cancel_event = threading.Event()
+        import signal
+        def _sig(sig, frame):
+            if not cancel_event.is_set():
+                log_cb("收到中断信号，正在优雅退出…")
+                cancel_event.set()
+        signal.signal(signal.SIGINT, _sig)
+        signal.signal(signal.SIGTERM, _sig)
+
+        try:
+            from word_freq_analyzer import run_llm_analysis_only
+        except ImportError as exc:
+            log_cb(f"[错误] 导入模块失败：{exc}")
+            return 2
+
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            run_llm_analysis_only(
+                sentences_source=resume_sentences,
+                output_path=args.output,
+                llm_api_key=resolved_api_key,
+                llm_model=args.llm_model,
+                llm_base_url=args.llm_base_url,
+                llm_max_sentences=args.llm_max_sentences,
+                llm_max_workers=args.llm_workers,
+                llm_max_retries=args.llm_max_retries,
+                llm_cache_path=llm_cache_path,
+                llm_system_prompt=llm_system_prompt,
+                log_cb=log_cb,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:
+            log_cb(f"[错误] LLM 续跑失败：{exc}")
+            import traceback
+            log_cb(traceback.format_exc())
+            return 1
+        log_cb("=" * 60)
+        log_cb("LLM 续跑完成！")
+        log_cb("=" * 60)
+        return 0
 
     log_cb("=" * 60)
     log_cb("中文文本词频统计分析工具 — 服务器模式")
@@ -349,6 +444,7 @@ def main() -> int:
             llm_max_workers=args.llm_workers,
             llm_max_retries=args.llm_max_retries,
             llm_cache_path=llm_cache_path,
+            llm_system_prompt=llm_system_prompt,
             analysis_workers=args.workers,
             jieba_userdict=args.jieba_userdict,
             log_cb=log_cb,

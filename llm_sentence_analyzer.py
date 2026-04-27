@@ -136,6 +136,7 @@ class LLMAnalyzerConfig:
     max_sentences: int = 500
     max_retries: int = 2
     cache_path: str | None = None
+    system_prompt: str | None = None  # None = 使用内置默认提示词
 
     @classmethod
     def from_inputs(
@@ -148,6 +149,7 @@ class LLMAnalyzerConfig:
         max_sentences: int = 500,
         max_retries: int = 2,
         cache_path: str | None = None,
+        system_prompt: str | None = None,
     ) -> "LLMAnalyzerConfig":
         resolved_key = (
             api_key.strip()
@@ -168,6 +170,7 @@ class LLMAnalyzerConfig:
             max_sentences=_safe_nonneg_int(max_sentences, 500),  # 0 = 无上限，不能用 _safe_int
             max_retries=_safe_int(max_retries, 2),
             cache_path=cache_path,
+            system_prompt=system_prompt or None,
         )
 
 
@@ -231,6 +234,14 @@ class QwenSentenceAnalyzer:
         # 降级后后续请求直接使用 json_object，避免重复触发 400 错误
         self._use_json_object_fallback = False
         self._fallback_lock = threading.Lock()
+        # 实际使用的系统提示词：优先用用户自定义，否则用内置默认
+        self._system_prompt: str = config.system_prompt or self.SYSTEM_PROMPT
+        # 当使用自定义提示词时，在缓存 key 中混入其哈希，避免与默认提示词的缓存冲突
+        self._prompt_hash_suffix: str = (
+            ""
+            if config.system_prompt is None
+            else (":" + hashlib.sha1(config.system_prompt.encode("utf-8")).hexdigest()[:8])
+        )
 
     def _log(self, msg: str) -> None:
         if self.log_cb:
@@ -258,10 +269,9 @@ class QwenSentenceAnalyzer:
             self._local.client = client
         return client
 
-    @staticmethod
-    def _record_key(record: dict[str, Any], model: str) -> str:
+    def _record_key(self, record: dict[str, Any], model: str) -> str:
         payload = {
-            "model": model,
+            "model": model + self._prompt_hash_suffix,
             "keyword": str(record.get("命中关键词", "")).strip(),
             "category": str(record.get("分类", "")).strip(),
             "sentence": str(record.get("命中句子", "")).strip(),
@@ -353,7 +363,7 @@ class QwenSentenceAnalyzer:
         request_kwargs: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": self._build_prompt(record)},
             ],
             "temperature": 0,
@@ -600,8 +610,16 @@ def apply_llm_sentence_analysis(
         return df_sentences
 
     analyzer = QwenSentenceAnalyzer(config, log_cb=log_cb, cancel_event=cancel_event)
-    records = df_sentences.to_dict(orient="records")
+
+    # 只提取 LLM 实际需要的 3 列转 dict，内存峰值从 ~6GB 降到 ~2.5GB
+    _llm_input_cols = [c for c in ["命中关键词", "分类", "命中句子"] if c in df_sentences.columns]
+    records = df_sentences[_llm_input_cols].to_dict(orient="records")
+    import gc as _gc
+    _gc.collect()
+
     llm_results = analyzer.analyze_records(records)
+    del records
+    _gc.collect()
 
     llm_columns = [
         "LLM时间指向",
@@ -616,4 +634,6 @@ def apply_llm_sentence_analysis(
         "LLM分析错误",
     ]
     llm_df = pd.DataFrame(llm_results, columns=llm_columns)
+    del llm_results
+    _gc.collect()
     return pd.concat([df_sentences.reset_index(drop=True), llm_df], axis=1)
