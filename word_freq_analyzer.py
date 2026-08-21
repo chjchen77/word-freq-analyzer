@@ -128,6 +128,46 @@ DEFAULT_STOPWORDS = frozenset({
 
 _NONE_LABEL = "（不选）"
 
+
+def _excel_cell_value(value):
+    """Normalize pandas/numpy scalars for row-wise xlsxwriter output."""
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, str) and len(value) > 32767:
+        return value[:32767]
+    return value
+
+
+def write_dataframes_xlsx(path: str, sheets: list[tuple[str, pd.DataFrame]]) -> None:
+    """
+    Write DataFrames row-by-row so xlsxwriter constant_memory mode remains safe.
+
+    pandas.to_excel can lose all but the first column when xlsxwriter is in
+    constant_memory mode because cells are not emitted strictly row by row.
+    """
+    import xlsxwriter
+
+    workbook = xlsxwriter.Workbook(path, {
+        "constant_memory": True,
+        "strings_to_urls": False,
+    })
+    try:
+        for sheet_name, df in sheets:
+            worksheet = workbook.add_worksheet(str(sheet_name)[:31])
+            worksheet.write_row(0, 0, [str(c) for c in df.columns])
+            for row_num, row in enumerate(df.itertuples(index=False, name=None), start=1):
+                worksheet.write_row(row_num, 0, [_excel_cell_value(v) for v in row])
+    finally:
+        workbook.close()
+
 # ============================================================
 # 词典管理器
 # ============================================================
@@ -511,25 +551,13 @@ def parse_year_column(series: pd.Series) -> pd.Series:
     return max(candidates, key=lambda s: int((s > 0).sum()))
 
 
-def split_sentences(text: str) -> list[str]:
-    """切分句子，专门处理年报 PDF 转文字后大量断行的问题。
-
-    策略：
-    1. 统一换行符为 \\n
-    2. 连续空行（>=2 个 \\n）= 真正的段落分隔，替换为句末标点
-    3. 单个 \\n = PDF 排版断行（非句子边界），直接删除，两边文字合并
-    4. 按句末标点 。！？ 切分，不切 ；
-    5. 过滤 < 8 字的碎片
-    """
-    # Step 1: 统一换行符
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Step 2: 连续空行 → 段落边界（视为句末）
-    text = re.sub(r"\n{2,}", "。", text)
-    # Step 3: 剩余单个 \n = 行内断字，直接删除
-    text = text.replace("\n", "")
-    # Step 4: 按句末标点切分
-    parts = re.split(r"[。！？!?]", text)
-    return [s.strip() for s in parts if len(s.strip()) >= 8]
+# 分句逻辑统一收敛到 sentence_split，避免与 count_mda_sentences 各存副本后漂移
+# （分子=命中句、分母=MD&A句数，两者口径必须完全一致）。
+from sentence_split import (  # noqa: E402
+    MAX_SENT_LEN,
+    is_table_like,
+    split_sentences,
+)
 
 
 def _mp_worker_init(all_dict_words_: set, jieba_userdict_: str, use_regex_: bool):
@@ -671,13 +699,22 @@ def _process_chunk(
     df = df[df["_year"] > 0].copy()  # v3.0: .copy() 防止 SettingWithCopyWarning
     if len(df) == 0:
         return None, raw_rows, 0, [], int(dropped_years)
-    text_series = df[available_text].fillna("").astype(str).agg("".join, axis=1)
+    # 多列文本必须带分隔符拼接：直接 "".join 会让上一列结尾字与下一列开头字
+    # 粘成不存在的词（如"生"+"态"→"生态"），既虚增词频也污染句子切分。
+    text_series = df[available_text].fillna("").astype(str).agg("\n\n".join, axis=1)
+
+    # 先切句，再在「切句结果」上计数，而非直接在原始文本上 str.count：
+    #   · 原始文本被 PDF 折行切断的关键词（"生态\n环境"）无法匹配，实测漏计约 7%；
+    #   · 分母 mda_sent 已剔除表格，分子若仍统计表格内命中则口径不一致。
+    # 切句结果同时供下方句子导出复用，避免重复切分。
+    sent_lists = [split_sentences(t) for t in text_series]
+    analysis_series = pd.Series(["\n".join(s) for s in sent_lists], index=df.index)
 
     # 关键词匹配
     if use_regex:
         # 一次性构建所有关键词计数列，避免逐列 insert 导致 DataFrame 碎片化
         kw_counts = {
-            kw: text_series.str.count(f"(?i){re.escape(kw)}")
+            kw: analysis_series.str.count(f"(?i){re.escape(kw)}")
             for kw in keywords
         }
         df = pd.concat([df, pd.DataFrame(kw_counts, index=df.index)], axis=1)
@@ -687,8 +724,9 @@ def _process_chunk(
         dict_set = all_dict_words
 
         # jieba 模式：列表累积后一次性构建 DataFrame（比 apply(pd.Series) 快 5-10x）
+        # 同样在切句结果上分词，与正则模式保持一致口径
         rows_list = []
-        for text in text_series:
+        for text in analysis_series:
             words = jieba.lcut(text)
             if use_stopwords and stopwords:
                 words = [w for w in words if w not in stopwords]
@@ -709,8 +747,8 @@ def _process_chunk(
     #   · 比 re.search 更快，且预计算 lower() 避免重复开销
     if do_export_sentences and n_hits > 0:
         match_mask = df[keywords].sum(axis=1) > 0
+        row_pos = {idx: i for i, idx in enumerate(df.index)}
         for row_idx in df[match_mask].index:
-            text = str(text_series.loc[row_idx])
             stkcd = df.loc[row_idx, "_stkcd"]
             year = int(df.loc[row_idx, "_year"])
             row_kws = [kw for kw in keywords if df.loc[row_idx, kw] > 0]
@@ -718,7 +756,7 @@ def _process_chunk(
                 continue
             # 每行预计算一次，避免在句子循环内重复 lower()
             kw_lower_pairs = [(kw, kw.lower()) for kw in row_kws]
-            for sent in split_sentences(text):
+            for sent in sent_lists[row_pos[row_idx]]:  # 复用上方切句结果
                 sent_lower = sent.lower()
                 for kw, kw_l in kw_lower_pairs:
                     if kw_l in sent_lower:
@@ -1130,15 +1168,15 @@ def run_analysis(
         {"项目": "重复关键词处理", "说明": "同一关键词出现在多个分类时，仅归入词典中最后定义的分类。详见【词典诊断】sheet。"},
         {"项目": "句子提取规则", "说明": "以。！？为句子边界切分；连续空行视为段落边界；单个换行视为PDF断行删除。最短句子长度=8字。"},
     ]
-    # 第一步：只写主表格（不含命中句子），用 xlsxwriter constant_memory 逐行落盘
+    # 第一步：只写主表格（不含命中句子）
     # 命中句子单独写入 _sentences.xlsx，避免大文件与大 DataFrame 同时驻留内存
-    with pd.ExcelWriter(output_path, engine="xlsxwriter",
-                        engine_kwargs={"options": {"constant_memory": True}}) as writer:
-        sheet1.to_excel(writer, sheet_name="公司年份分类统计", index=False)
-        sheet2.to_excel(writer, sheet_name="关键词明细", index=False)
-        sheet3.to_excel(writer, sheet_name="分类汇总", index=False)
-        sheet_dict_diag.to_excel(writer, sheet_name="词典诊断", index=False)
-        pd.DataFrame(_explain_rows).to_excel(writer, sheet_name="分析说明", index=False)
+    write_dataframes_xlsx(output_path, [
+        ("公司年份分类统计", sheet1),
+        ("关键词明细", sheet2),
+        ("分类汇总", sheet3),
+        ("词典诊断", sheet_dict_diag),
+        ("分析说明", pd.DataFrame(_explain_rows)),
+    ])
     log(f"词频结果已保存至：{output_path}")
 
     # 词频 Excel 已落盘 → 断点目录使命完成，清理掉节省磁盘空间
@@ -1176,9 +1214,7 @@ def run_analysis(
         _n_pre = min(MAX_EXCEL_ROWS, len(df_sent))
         _df_pre = df_sent.head(_n_pre).copy()
         _df_pre.insert(0, "序号", range(1, _n_pre + 1))
-        with pd.ExcelWriter(_sent_path, engine="xlsxwriter",
-                            engine_kwargs={"options": {"constant_memory": True}}) as writer:
-            _df_pre.to_excel(writer, sheet_name="命中句子", index=False)
+        write_dataframes_xlsx(_sent_path, [("命中句子", _df_pre)])
         del _df_pre
         gc.collect()
         log(f"命中句子已保存至：{_sent_path}（LLM 分析完成后将更新）")
@@ -1262,9 +1298,7 @@ def run_analysis(
         gc.collect()
         _sent_out.insert(0, "序号", range(1, len(_sent_out) + 1))
         log("正在将命中句子写入 Excel…")
-        with pd.ExcelWriter(_sent_path, engine="xlsxwriter",
-                            engine_kwargs={"options": {"constant_memory": True}}) as writer:
-            _sent_out.to_excel(writer, sheet_name="命中句子", index=False)
+        write_dataframes_xlsx(_sent_path, [("命中句子", _sent_out)])
         log(f"命中句子已写入：{_sent_path}（{len(_sent_out)} 条）")
         del _sent_out
         gc.collect()
@@ -1416,9 +1450,7 @@ def run_llm_analysis_only(
 
     _sent_out.insert(0, "序号", range(1, len(_sent_out) + 1))
     log("[LLM续跑] 正在写入命中句子 Excel…")
-    with pd.ExcelWriter(_sent_path, engine="xlsxwriter",
-                        engine_kwargs={"options": {"constant_memory": True}}) as writer:
-        _sent_out.to_excel(writer, sheet_name="命中句子", index=False)
+    write_dataframes_xlsx(_sent_path, [("命中句子", _sent_out)])
     log(f"[LLM续跑] 完成！命中句子已写入：{_sent_path}（{len(_sent_out)} 条）")
     del _sent_out
     gc.collect()

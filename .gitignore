@@ -24,3 +24,19 @@ env/
 .vscode/
 *.swp
 *.swo
+
+# 分析产物与数据（体量大且与代码无关，不入库）
+结果/
+*.zip
+*.xlsx
+*.xls
+*.csv
+*.dta
+*.db
+
+# R
+.Rhistory
+
+# 本地缓存
+llm_cache*.json
+llm_cache*.db
