@@ -60,6 +60,31 @@ RESULT_SCHEMA = {
     "required": ["rel", "time", "voice", "type", "cert", "quant", "tone", "conf"],
 }
 
+# 启用双轨评分时在上述 schema 基础上追加的两个字段（TNFD 双重实质性）：
+# phys  物理实质性 0-4：企业与实体生态是否有直接物理交互
+# trans 转型实质性 0-4：企业是否识别政策/技术/市场变化带来的约束或机遇
+_DUAL_PROPERTIES = {
+    "phys":  {"type": "integer", "enum": [0, 1, 2, 3, 4]},
+    "trans": {"type": "integer", "enum": [0, 1, 2, 3, 4]},
+}
+
+# 双轨模式下，rubric 会「替换」而非「追加」到内置提示词之后。
+# 原因：内置提示词的主体是大段 rel=0 排除规则（商业生态圈、机场驱鸟、
+# 口腔生物修复等逐词细则），会把模型整体拽向保守。实测同 150 句、同
+# qwen3.7-max：追加式下物理维度检出率 15%、与纯 rubric 基准 κ 仅 0.54；
+# 改为替换式后回到 21% / κ 0.67，转型维度更是几乎完全复现（49% vs 50%，
+# κ 0.72）。故双轨模式只保留下面这份精简的其他字段编码，不带排除规则。
+# rel 字段在双轨模式下由评分取代（phys/trans ≥1 即视为相关），不再单列。
+_DUAL_OUTPUT_SPEC = """
+
+═══ 输出要求 ═══
+只返回 JSON 整数，禁止输出任何额外文字：
+phys  物理实质性得分（0-4）
+trans 转型实质性得分（0-4）
+conf  本次判断的置信度：低=0，中=1，高=2
+两个评分维度独立，互不传染：有物理行动不等于识别了转型风险，反之亦然。
+"""
+
 # 400 BadRequest 时才触发 json_schema → json_object 降级，
 # 这些关键词用于识别"模型不支持该 response_format"类错误。
 _FORMAT_UNSUPPORTED_KEYWORDS = (
@@ -136,6 +161,9 @@ class LLMAnalyzerConfig:
     max_retries: int = 2
     cache_path: str | None = None
     system_prompt: str | None = None  # None = 使用内置默认提示词
+    # 双轨评分标准文件（Markdown）。给定后，其内容追加到系统提示词，
+    # 并额外要求模型输出 phys / trans 两个 0-4 分。留空则维持原有行为。
+    rubric_path: str | None = None
 
     @classmethod
     def from_inputs(
@@ -149,6 +177,7 @@ class LLMAnalyzerConfig:
         max_retries: int = 2,
         cache_path: str | None = None,
         system_prompt: str | None = None,
+        rubric_path: str | None = None,
     ) -> "LLMAnalyzerConfig":
         resolved_key = (
             api_key.strip()
@@ -170,6 +199,7 @@ class LLMAnalyzerConfig:
             max_retries=_safe_int(max_retries, 2),
             cache_path=cache_path,
             system_prompt=system_prompt or None,
+            rubric_path=(rubric_path or os.getenv("LLM_RUBRIC_PATH", "")).strip() or None,
         )
 
 
@@ -371,8 +401,43 @@ conf 置信度：低=0，中=1，高=2"""
         # 常量后重跑，key 完全不变 —— 缓存会原样吐回旧标注，改词无效且难以察觉。
         # 这里改为始终按生效提示词取哈希；_LEGACY_PROMPT_SHA 是历史默认提示词的
         # 哈希，命中它时沿用空后缀，使既有缓存继续可用。
+        # 双轨评分：把外部 rubric 追加到系统提示词，并扩展 JSON schema。
+        # rubric 内容参与提示词哈希，因此修订标准会自动令旧缓存失效。
+        self._dual_scoring: bool = bool(config.rubric_path)
+        if self._dual_scoring:
+            rubric = Path(config.rubric_path).read_text(encoding="utf-8")
+            # 替换而非追加：详见 _DUAL_OTHER_FIELDS 处的实测说明。
+            # 用户显式传入 system_prompt 时以其为准，视为有意覆盖。
+            base = config.system_prompt or ""
+            self._system_prompt = (
+                f"{base}\n\n{rubric}" if base else rubric
+            ) + _DUAL_OUTPUT_SPEC
+            # 只保留评分与置信度：语气/句子类型等字段留给「第二遍」用内置
+            # 提示词单独跑（其哈希不变，可完整复用既有缓存），两遍互不污染。
+            self._schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    **_DUAL_PROPERTIES,
+                    "conf": {"type": "integer", "enum": [0, 1, 2]},
+                },
+                "required": ["phys", "trans", "conf"],
+            }
+        else:
+            self._schema = RESULT_SCHEMA
+        # 双轨模式下缓存条目必须同时含两个评分列，避免中途切换模式时
+        # 复用到缺列的旧条目（提示词哈希已隔离，此处为双保险）。
+        self._required_cache_keys = _REQUIRED_CACHE_KEYS | (
+            {"LLM物理分数", "LLM转型分数"} if self._dual_scoring else set()
+        )
+
         digest = hashlib.sha1(self._system_prompt.encode("utf-8")).hexdigest()[:8]
         self._prompt_hash_suffix: str = "" if digest == _LEGACY_PROMPT_SHA else f":{digest}"
+
+    @property
+    def dual_scoring(self) -> bool:
+        """是否启用了双轨评分（由 config.rubric_path 决定）。"""
+        return self._dual_scoring
 
     def _log(self, msg: str) -> None:
         if self.log_cb:
@@ -549,11 +614,23 @@ conf 置信度：低=0，中=1，高=2"""
 
     def _normalize_result(self, data: dict[str, Any]) -> dict[str, Any]:
         # 空响应或缺失所有维度字段时返回失败，避免将全默认值误写为"成功"
-        if not isinstance(data, dict) or not any(k in data for k in _EXPECTED_RESULT_KEYS):
+        expected = ({"phys", "trans"} if self._dual_scoring else _EXPECTED_RESULT_KEYS)
+        if not isinstance(data, dict) or not any(k in data for k in expected):
             return _failed_result("LLM返回了空响应或格式不符合预期（缺少所有维度字段）")
         sc = self._safe_code
+        dual: dict[str, Any] = {}
+        if self._dual_scoring:
+            phys = sc(data.get("phys"), {0, 1, 2, 3, 4}, 0)
+            trans = sc(data.get("trans"), {0, 1, 2, 3, 4}, 0)
+            dual = {"LLM物理分数": phys, "LLM转型分数": trans}
+            # 双轨模式不再要求模型单独判 rel，改由评分派生：任一维度 ≥1 即相关。
+            # 这样 rel 与评分天然自洽，不会出现"rel=0 但物理得 3 分"的矛盾。
+            rel_default = 1 if max(phys, trans) >= 1 else 0
+        else:
+            rel_default = 1
         return {
-            "LLM相关性":   sc(data.get("rel"),   {0, 1},             1),
+            **dual,
+            "LLM相关性":   sc(data.get("rel"),   {0, 1},   rel_default),
             "LLM时间指向": sc(data.get("time"),  {0, 1, 2, 3, 4},    0),
             "LLM语态":     sc(data.get("voice"), {0, 1, 2},           0),
             "LLM句子类型": sc(data.get("type"),  {0, 1, 2, 3, 4, 5, 6}, 0),
@@ -603,7 +680,9 @@ conf 置信度：低=0，中=1，高=2"""
                 {"role": "user", "content": self._build_prompt(record)},
             ],
             "temperature": 0,
-            "max_tokens": 300,
+            # 双轨模式字段更多，且部分模型会先产生一段内部推理再给出 JSON，
+            # 预算过小会导致响应被截断成非法 JSON。
+            "max_tokens": 1024 if self._dual_scoring else 300,
         }
 
         # 如果本次会话已确认模型不支持 json_schema，直接使用 json_object
@@ -618,7 +697,7 @@ conf 置信度：低=0，中=1，高=2"""
                         "json_schema": {
                             "name": "annual_report_sentence_analysis",
                             "strict": True,
-                            "schema": RESULT_SCHEMA,
+                            "schema": self._schema,
                         },
                     },
                     **request_kwargs,
@@ -725,7 +804,7 @@ conf 置信度：低=0，中=1，高=2"""
             cached = self._cache.get(key)
             if (isinstance(cached, dict)
                     and cached.get("LLM分析状态") == "成功"
-                    and _REQUIRED_CACHE_KEYS.issubset(cached.keys())):
+                    and self._required_cache_keys.issubset(cached.keys())):
                 result_by_key[key] = cached
                 cache_hits += 1
                 continue
@@ -857,6 +936,8 @@ def apply_llm_sentence_analysis(
     _gc.collect()
 
     llm_columns = [
+        # 双轨评分列仅在启用 rubric 时产生，未启用时该列全为空值
+        *(["LLM物理分数", "LLM转型分数"] if analyzer.dual_scoring else []),
         "LLM相关性",
         "LLM时间指向",
         "LLM语态",
