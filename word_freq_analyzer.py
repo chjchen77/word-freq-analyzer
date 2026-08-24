@@ -709,6 +709,13 @@ def _process_chunk(
     # 切句结果同时供下方句子导出复用，避免重复切分。
     sent_lists = [split_sentences(t) for t in text_series]
     analysis_series = pd.Series(["\n".join(s) for s in sent_lists], index=df.index)
+    # 原始文本此后不再使用（计数走 analysis_series，导出走 sent_lists），
+    # 提前释放为后续 190 个关键词的计数腾出余量。
+    # 注意这并不降低峰值——峰值出现在上一行切句期间（原文与切句结果并存）。
+    # 300 份 MD&A 实测增量 21 MB，按 CHUNK_ROWS=5 万行线性外推约 3.4 GB；
+    # 真正削峰需改为分片切句。当前逐 txt 文件处理时每块仅 1 行，不触发该
+    # 路径；若日后以 5 万行 CSV 作为输入，需先做分片。
+    del text_series
 
     # 关键词匹配
     if use_regex:
