@@ -22,14 +22,18 @@ DEFAULT_MODEL = "qwen3.7-max"
 # 单句最大字符数，超过则截断后再送给 LLM（节省 token，防止超出上下文）
 _MAX_SENTENCE_CHARS = 500
 
-# 单次 API 请求超时秒数
-_REQUEST_TIMEOUT = 60.0
+# 单次 API 请求超时秒数。挂载大体量 rubric 时模型需先读完整套评分标准，
+# 高并发下单次响应可超过一分钟，60s 会把正常请求误判为超时。
+_REQUEST_TIMEOUT = 180.0
 
 # 重试退避基础秒数（第 n 次重试等待 n * _RETRY_BACKOFF_BASE 秒）
 _RETRY_BACKOFF_BASE = 1.0
 
-# 429 限速专项重试上限（独立于普通错误重试，指数退避最长 60s）
-_MAX_RATE_LIMIT_RETRIES = 10
+# 429 限速专项重试上限（独立于普通错误重试，指数退避最长 60s）。
+# 1000 句实测：前 939 句零失败，末 61 句失败 54 条（89%）——失败并非随机，
+# 而是跑到后段配额压力累积、10 次重试走完仍未恢复所致。长任务须给足重试次数，
+# 按最长退避 60s 计，40 次约可硬扛 35 分钟的持续限流。
+_MAX_RATE_LIMIT_RETRIES = 40
 
 # 增量缓存：每成功 N 条写一次盘，防止长时间运行中途崩溃丢失进度
 _CACHE_SAVE_INTERVAL = 50
@@ -158,7 +162,7 @@ class LLMAnalyzerConfig:
     base_url: str = DEFAULT_BASE_URL
     max_workers: int = 4
     max_sentences: int = 500
-    max_retries: int = 2
+    max_retries: int = 6
     cache_path: str | None = None
     system_prompt: str | None = None  # None = 使用内置默认提示词
     # 双轨评分标准文件（Markdown）。给定后，其内容追加到系统提示词，
@@ -174,7 +178,7 @@ class LLMAnalyzerConfig:
         base_url: str = DEFAULT_BASE_URL,
         max_workers: int = 4,
         max_sentences: int = 500,
-        max_retries: int = 2,
+        max_retries: int = 6,
         cache_path: str | None = None,
         system_prompt: str | None = None,
         rubric_path: str | None = None,
@@ -196,7 +200,7 @@ class LLMAnalyzerConfig:
             base_url=resolved_base_url.rstrip("/"),
             max_workers=_safe_int(max_workers, 4),
             max_sentences=_safe_nonneg_int(max_sentences, 500),  # 0 = 无上限，不能用 _safe_int
-            max_retries=_safe_int(max_retries, 2),
+            max_retries=_safe_int(max_retries, 6),
             cache_path=cache_path,
             system_prompt=system_prompt or None,
             rubric_path=(rubric_path or os.getenv("LLM_RUBRIC_PATH", "")).strip() or None,
@@ -539,10 +543,15 @@ conf 置信度：低=0，中=1，高=2"""
                 self._log(f"⚠️  JSON→SQLite 迁移失败（{exc}），将继续使用 JSON 缓存。")
                 db_path = None  # type: ignore[assignment]
 
-        # ── 打开 SQLite ───────────────────────────────────────────────
-        if db_path is not None and db_path.exists():
+        # ── 打开 SQLite（文件不存在则新建）─────────────────────────────
+        # 注意：这里不能要求 db_path 已存在。首次运行时文件尚未生成，若因此
+        # 跳过 SQLite，就会降级成普通 dict，并把 JSON 内容写进 .db 文件；
+        # 下次启动按 SQLite 打开必然失败（file is not a database），
+        # 整份缓存随之作废——长任务中断后将被迫从头重跑。
+        if db_path is not None:
             try:
                 import sqlite3 as _sq3
+                db_path.parent.mkdir(parents=True, exist_ok=True)
                 conn = _sq3.connect(str(db_path), check_same_thread=False)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
