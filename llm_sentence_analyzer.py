@@ -85,8 +85,11 @@ _DUAL_OUTPUT_SPEC = """
 只返回 JSON 整数，禁止输出任何额外文字：
 phys  物理实质性得分（0-4）
 trans 转型实质性得分（0-4）
+tone  句子语气：消极=0，中性=1，积极=2
 conf  本次判断的置信度：低=0，中=1，高=2
 两个评分维度独立，互不传染：有物理行动不等于识别了转型风险，反之亦然。
+tone 只描述陈述语气本身，与上面两个得分无关：得分高不代表语气积极，
+得分为 0 也不代表语气消极。
 """
 
 # 400 BadRequest 时才触发 json_schema → json_object 降级，
@@ -423,9 +426,13 @@ conf 置信度：低=0，中=1，高=2"""
                 "additionalProperties": False,
                 "properties": {
                     **_DUAL_PROPERTIES,
+                    # tone 为面板变量所必需（语调积极/消极/中性分组计数）。
+                    # 曾试过把 time/voice/type/cert/quant 等整套字段一并要求，
+                    # 实测会把转型分推高（>0 由 49% 升至 58%），故只保留 tone。
+                    "tone": {"type": "integer", "enum": [0, 1, 2]},
                     "conf": {"type": "integer", "enum": [0, 1, 2]},
                 },
-                "required": ["phys", "trans", "conf"],
+                "required": ["phys", "trans", "tone", "conf"],
             }
         else:
             self._schema = RESULT_SCHEMA

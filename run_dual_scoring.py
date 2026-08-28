@@ -53,8 +53,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_sentences(path: str) -> pd.DataFrame:
-    return (pd.read_csv(path) if path.lower().endswith(".csv")
-            else pd.read_excel(path))
+    """股票代码固定为字符串，避免 "000001" 被推断成整数而丢掉前导零。"""
+    kw = {"dtype": {"公司代码": str}}
+    return (pd.read_csv(path, **kw) if path.lower().endswith(".csv")
+            else pd.read_excel(path, **kw))
 
 
 def main() -> None:
@@ -89,8 +91,10 @@ def main() -> None:
     if not analyzer.dual_scoring:
         sys.exit(f"未能加载评分标准：{args.rubric}")
 
+    ckpt_path = args.out + ".partial.csv"
     print(f"共 {len(df):,} 句，分 {len(groups)} 片；缓存 {args.cache}", flush=True)
-    print(f"模型 {analyzer.config.model}，并发 {args.workers}\n", flush=True)
+    print(f"模型 {analyzer.config.model}，并发 {args.workers}", flush=True)
+    print(f"检查点 {ckpt_path}（每片更新，原子替换）\n", flush=True)
 
     done_parts: list[pd.DataFrame] = []
     t_start = time.time()
@@ -107,13 +111,21 @@ def main() -> None:
         part = part.copy()
         part["LLM物理分数"] = [o.get("LLM物理分数") for o in out]
         part["LLM转型分数"] = [o.get("LLM转型分数") for o in out]
+        # 语气语调用于面板的「语调积极/消极/中性」分组计数，必须落盘，
+        # 否则模型算了、也计了费，结果却被丢弃。
+        part["LLM语气语调"] = [o.get("LLM语气语调") for o in out]
         part["LLM置信度"] = [o.get("LLM置信度") for o in out]
         part["LLM分析状态"] = [o.get("LLM分析状态") for o in out]
         part["LLM分析错误"] = [o.get("LLM分析错误") for o in out]
         done_parts.append(part)
 
-        # 每片结束即写盘：中途中断也能拿到已完成部分
-        pd.concat(done_parts, ignore_index=True).to_excel(args.out, index=False)
+        # 每片结束落一次检查点。用 CSV 而非 Excel：同样 12 万行，Excel 写一次
+        # 需 44 秒、CSV 仅 1 秒，25 片累计可省约 18 分钟；更要紧的是那 44 秒里
+        # 若进程被杀，Excel 文件会残缺不可读。
+        # 先写临时文件再 os.replace 原子替换，确保检查点任何时刻都是完整的。
+        tmp = ckpt_path + ".tmp"
+        pd.concat(done_parts, ignore_index=True).to_csv(tmp, index=False)
+        os.replace(tmp, ckpt_path)
 
         finished += len(part)
         ok = (part["LLM分析状态"] == "成功").sum()
@@ -125,6 +137,10 @@ def main() -> None:
               f"预计剩余 {eta:.1f} 小时\n", flush=True)
 
     final = pd.concat(done_parts, ignore_index=True)
+    # Excel 只在全部跑完后写一次；同样先写临时文件再原子替换
+    tmp_xlsx = args.out + ".tmp.xlsx"
+    final.to_excel(tmp_xlsx, index=False)
+    os.replace(tmp_xlsx, args.out)
     ok = (final["LLM分析状态"] == "成功").sum()
     print(f"全部完成：{ok:,}/{len(final):,} 成功，"
           f"总耗时 {(time.time() - t_start) / 3600:.1f} 小时")
