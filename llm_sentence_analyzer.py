@@ -108,13 +108,13 @@ _FORMAT_UNSUPPORTED_KEYWORDS = (
 # 哈希改变 → key 改变 → 缓存自动失效并重新请求。切勿随提示词改动而更新此常量。
 _LEGACY_PROMPT_SHA = "fea337e2"
 
-# _normalize_result：LLM 返回的 JSON 中至少要包含其中一个字段才视为有效响应
+# _normalize_result：LLM 返回的 JSON 必须包含当前模式要求的全部字段才视为有效响应
 _EXPECTED_RESULT_KEYS = frozenset({"rel", "time", "voice", "type", "cert", "quant", "tone", "conf"})
 
 # 缓存命中校验：所有字段都存在时才使用缓存，防止格式不完整的旧缓存污染结果
 _REQUIRED_CACHE_KEYS = frozenset({
     "LLM相关性", "LLM时间指向", "LLM语态", "LLM句子类型",
-    "LLM确定性", "LLM量化属性", "LLM语气语调", "LLM分析状态",
+    "LLM确定性", "LLM量化属性", "LLM语气语调", "LLM置信度", "LLM分析状态",
 })
 
 
@@ -147,9 +147,10 @@ def _is_format_unsupported_error(exc: Exception) -> bool:
     exc_type = type(exc).__name__
     exc_msg = str(exc).lower()
 
-    # openai 库的 BadRequestError / InvalidRequestError 对应 HTTP 400
+    # openai 库的 BadRequestError / InvalidRequestError 也可能表示其他 400
+    # 参数错误，只有错误内容明确提到 response_format/schema 才允许降级。
     if exc_type in ("BadRequestError", "InvalidRequestError"):
-        return True
+        return any(kw in exc_msg for kw in _FORMAT_UNSUPPORTED_KEYWORDS)
 
     # 某些 SDK 版本用 APIStatusError，通过状态码 + 关键词双重判断
     if "400" in exc_msg and any(kw in exc_msg for kw in _FORMAT_UNSUPPORTED_KEYWORDS):
@@ -629,10 +630,14 @@ conf 置信度：低=0，中=1，高=2"""
             return default
 
     def _normalize_result(self, data: dict[str, Any]) -> dict[str, Any]:
-        # 空响应或缺失所有维度字段时返回失败，避免将全默认值误写为"成功"
-        expected = ({"phys", "trans"} if self._dual_scoring else _EXPECTED_RESULT_KEYS)
-        if not isinstance(data, dict) or not any(k in data for k in expected):
-            return _failed_result("LLM返回了空响应或格式不符合预期（缺少所有维度字段）")
+        # 部分字段缺失时也必须判为失败，避免缺列被静默填默认值后伪装成成功。
+        expected = (
+            {"phys", "trans", "tone", "conf"}
+            if self._dual_scoring else _EXPECTED_RESULT_KEYS
+        )
+        if not isinstance(data, dict) or not expected.issubset(data.keys()):
+            missing = sorted(expected - set(data.keys())) if isinstance(data, dict) else sorted(expected)
+            return _failed_result(f"LLM返回了空响应或格式不符合预期（缺少字段：{', '.join(missing)}）")
         sc = self._safe_code
         dual: dict[str, Any] = {}
         if self._dual_scoring:
@@ -685,14 +690,10 @@ conf 置信度：低=0，中=1，高=2"""
         request_kwargs: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
-                # 系统提示词在所有请求间完全相同，且体量远大于用户内容，
-                # 打上 cache_control 走显式上下文缓存：命中部分按 10% 计费
-                # （首次创建 125%，每次命中续期 5 分钟）。
-                # 实测 qwen3.7-max：不加此标记仅隐式命中约 62%，加后达 99%。
-                {"role": "system", "content": [
-                    {"type": "text", "text": self._system_prompt,
-                     "cache_control": {"type": "ephemeral"}},
-                ]},
+                # 使用所有 OpenAI-compatible 服务都支持的纯字符串消息。
+                # cache_control 是少数供应商的扩展字段，放在这里会导致其他
+                # 兼容接口直接返回 400，且无法进入正常的格式降级逻辑。
+                {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": self._build_prompt(record)},
             ],
             "temperature": 0,

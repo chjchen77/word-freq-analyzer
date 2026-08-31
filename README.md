@@ -7,7 +7,7 @@
 - 支持 `.xlsx` / `.xls` / `.csv` / `.txt` 数据文件，自动递归扫描子文件夹
 - 支持分类词典管理（多分类、多关键词；多选批量删除、实时搜索、分类重命名）
 - 双模式匹配：**正则匹配**（推荐）和 **jieba 中文分词**
-- 大文件自动分块处理（CSV > 100MB 自动分块读取）
+- 大文件自动分块处理（`.xlsx` 流式读取，CSV > 100MB 自动分块读取）
 - 多线程并发文件处理（可配置工作线程数，M4 Pro 推荐 4–8）
 - 输出 Excel 面板数据（多 Sheet），含分类统计、关键词明细、词典诊断、分析说明
 - 支持分类占比标准化、停用词过滤、命中句子导出
@@ -45,6 +45,23 @@ pip install -r requirements.txt
 
 # 运行程序
 python word_freq_analyzer.py
+```
+
+## 项目结构
+
+- `word_freq_analyzer.py`：主程序和数据处理核心
+- `run_server.py`：本地服务启动入口
+- `run_full_wordfreq.py`、`run_dual_scoring.py`：批量词频与双轨评分脚本
+- `extract_mda_*.py`、`count_mda_sentences.py`：年报文本抽取与句子统计工具
+- `rubrics/`：外置评分规则
+- `tests/`：自动化回归测试
+- `.local/`：本地运行结果和缓存，不参与版本管理
+- `dist/`：本地打包产物，不参与版本管理
+
+运行测试：
+
+```bash
+pytest -q
 ```
 
 ## 从源码构建
@@ -111,7 +128,7 @@ build_windows.bat
 | 分类汇总 | 各分类总次数和占比 |
 | 词典诊断 | 跨分类重复关键词检查报告 |
 | 分析说明 | 计数规则与方法论说明 |
-| 命中句子 | 含关键词的原文句子（含序号，可选）；启用 LLM 后追加 6 维标注列 |
+| 独立命中句子文件 | 可选输出为同名 `_sentences.xlsx`；超出 Excel 上限时另存完整 CSV，启用 LLM 后追加标注列 |
 
 ### LLM 句子分析
 
@@ -128,7 +145,7 @@ build_windows.bat
 | LLM置信度 | 高 / 中 / 低 |
 | LLM分析状态 | 成功 / 跳过 / 失败 / 已取消 |
 
-支持本地 JSON 缓存：相同句子重复运行自动跳过，节省 API 费用。每句约消耗 200–500 token。
+支持本地 SQLite/JSON 缓存：相同句子重复运行自动跳过，节省 API 费用。每句约消耗 200–500 token。
 
 ## 依赖
 
@@ -137,6 +154,7 @@ build_windows.bat
 - [xlrd](https://xlrd.readthedocs.io/) >= 2.0.1 — .xls 文件读取
 - [jieba](https://github.com/fxsjy/jieba) >= 0.42.1 — 中文分词（仅 jieba 模式时加载）
 - [openai](https://github.com/openai/openai-python) >= 1.0.0 — LLM 接口（仅启用 LLM 分析时使用）
+- [xlsxwriter](https://xlsxwriter.readthedocs.io/) >= 3.0.0 — 大数据量 Excel 结果写出
 
 ## 版本历史
 

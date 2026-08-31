@@ -8,7 +8,7 @@ REM 打包后的 .exe 不需要安装 Python 即可运行。
 REM
 REM 前置条件：
 REM   1. 安装 Python 3.10 或更高版本
-REM   2. pip install pyinstaller jieba pandas openpyxl xlrd
+REM   2. pip install pyinstaller jieba pandas openpyxl xlrd openai xlsxwriter
 REM
 REM 用法：双击此文件 或 在命令行中运行 build_windows.bat
 REM ============================================================
@@ -28,7 +28,7 @@ if errorlevel 1 (
 
 REM 检查并安装依赖
 echo 检查依赖...
-pip install -q pyinstaller jieba pandas openpyxl xlrd openai
+pip install -q pyinstaller jieba pandas openpyxl xlrd openai xlsxwriter
 
 REM 清理旧构建
 if exist build rmdir /s /q build
@@ -46,6 +46,7 @@ pyinstaller ^
     --hidden-import openpyxl ^
     --hidden-import xlrd ^
     --hidden-import openai ^
+    --hidden-import xlsxwriter ^
     --hidden-import jieba.finalseg ^
     --hidden-import jieba.posseg ^
     --hidden-import jieba.analyse ^

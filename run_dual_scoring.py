@@ -61,10 +61,14 @@ def load_sentences(path: str) -> pd.DataFrame:
 
 def main() -> None:
     args = parse_args()
+    if args.workers < 1:
+        sys.exit("--workers 必须是正整数。")
     if not os.environ.get("DASHSCOPE_API_KEY"):
         sys.exit("缺少环境变量 DASHSCOPE_API_KEY")
 
     df = load_sentences(args.sentences)
+    if df.empty:
+        sys.exit("输入文件没有可评分的命中句子。")
     for col in (args.col_keyword, args.col_sentence):
         if col not in df.columns:
             sys.exit(f"输入文件缺少必需列：{col}（现有列：{list(df.columns)}）")
@@ -73,7 +77,8 @@ def main() -> None:
 
     # 按年份分片：每片独立落盘，中途可取用已完成年份
     if args.col_year in df.columns:
-        groups = [(str(y), g) for y, g in df.groupby(args.col_year, sort=True)]
+        # dropna=False，避免空年份行被 pandas 静默丢弃。
+        groups = [(str(y), g) for y, g in df.groupby(args.col_year, sort=True, dropna=False)]
     else:
         groups = [("全部", df)]
 
@@ -136,6 +141,8 @@ def main() -> None:
               f"耗时 {el / 60:.1f} 分钟｜累计 {finished:,}/{len(df):,}，"
               f"预计剩余 {eta:.1f} 小时\n", flush=True)
 
+    if not done_parts:
+        sys.exit("没有生成评分结果；请检查输入文件和分析是否被取消。")
     final = pd.concat(done_parts, ignore_index=True)
     # Excel 只在全部跑完后写一次；同样先写临时文件再原子替换
     tmp_xlsx = args.out + ".tmp.xlsx"

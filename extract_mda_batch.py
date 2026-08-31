@@ -35,12 +35,22 @@ def main() -> None:
 
     if not src_root.is_dir():
         raise SystemExit(f"源目录不存在：{src_root}")
+    if out_root == src_root:
+        raise SystemExit("输出目录不能与源目录相同，否则会覆盖原始 txt 文件。")
     if args.start < 0 or args.limit <= 0:
         raise SystemExit("start 必须大于等于 0，limit 必须大于 0")
+
+    def _is_inside(path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent)
+            return True
+        except ValueError:
+            return False
 
     all_files = sorted(
         p for p in src_root.rglob("*.txt")
         if p.is_file() and not p.name.startswith(".")
+        and not _is_inside(p, out_root)
     )
     files = all_files[args.start:args.start + args.limit]
     if not files:

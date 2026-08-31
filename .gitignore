@@ -2,12 +2,18 @@
 dist/
 build/
 *.spec
+.local/
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
+.pytest_cache/
+.coverage
+.coverage.*
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environment
 venv/
@@ -40,3 +46,4 @@ env/
 # 本地缓存
 llm_cache*.json
 llm_cache*.db
+*.log

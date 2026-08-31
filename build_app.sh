@@ -10,7 +10,7 @@
 #   ./build_app.sh
 #
 # 前置条件：
-#   pip install pyinstaller jieba pandas openpyxl xlrd openai
+#   pip install pyinstaller jieba pandas openpyxl xlrd openai xlsxwriter
 # ============================================================
 
 set -e
@@ -48,6 +48,7 @@ pyinstaller \
     --hidden-import openpyxl \
     --hidden-import xlrd \
     --hidden-import openai \
+    --hidden-import xlsxwriter \
     --hidden-import jieba.finalseg \
     --hidden-import jieba.posseg \
     --hidden-import jieba.analyse \

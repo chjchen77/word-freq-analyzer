@@ -18,7 +18,7 @@ python3 run_server.py \
     --dict /data/dict/keywords.xlsx \
     --output /data/output/result.xlsx \
     --llm-api-key sk-xxxx \
-    --llm-model qwen-turbo \
+    --llm-model qwen3.7-max \
     --llm-max-sentences 0 \
     --llm-workers 16 \
     --log-file /data/output/run.log
@@ -35,6 +35,8 @@ import os
 import sys
 import threading
 from pathlib import Path
+
+from llm_sentence_analyzer import DEFAULT_MODEL
 
 # ── 确保脚本所在目录在 Python 路径中 ────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -143,13 +145,13 @@ def _parse_args() -> argparse.Namespace:
         "--export-sentences",
         action="store_true",
         default=False,
-        help="导出命中句子 Sheet（启用 LLM 时自动开启）",
+        help="导出命中句子到独立 _sentences.xlsx（启用 LLM 时自动开启）",
     )
     p.add_argument(
         "--use-tf",
         action="store_true",
         default=False,
-        help="输出词频标准化（TF）占比列",
+        help="输出分类构成比列（分类命中次数 / 该行总命中次数）",
     )
     p.add_argument(
         "--jieba-userdict",
@@ -168,9 +170,9 @@ def _parse_args() -> argparse.Namespace:
     )
     g.add_argument(
         "--llm-model",
-        default="qwen-turbo",
+        default=DEFAULT_MODEL,
         metavar="MODEL",
-        help="模型名称（默认：qwen-turbo；服务器长跑推荐 turbo，便宜 7x）",
+        help=f"模型名称（默认：{DEFAULT_MODEL}）",
     )
     g.add_argument(
         "--llm-base-url",
@@ -197,13 +199,13 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         metavar="N",
-        help="LLM 普通错误最大重试次数（默认：2；429 限速独立最多重试 10 次）",
+        help="LLM 普通错误最大重试次数（默认：2；429 限速独立最多重试 40 次）",
     )
     g.add_argument(
         "--llm-cache",
         default="",
         metavar="FILE",
-        help="LLM 缓存文件路径（默认：与 --output 同目录下的 llm_cache.json）",
+        help="LLM 缓存文件路径（默认：与 --output 同目录下的 llm_cache.json，程序会升级为 SQLite）",
     )
     g.add_argument(
         "--llm-system-prompt-file",
@@ -212,8 +214,8 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "自定义 LLM 系统提示词文件路径（UTF-8 纯文本）。\n"
             "不传则使用内置默认提示词（推荐大多数情况）。\n"
-            "注意：修改提示词后，已缓存的结果不会被重新分析；\n"
-            "如需全量重跑请删除或重命名 llm_cache.json。"
+            "注意：修改提示词会自动使旧缓存失效并重新分析；\n"
+            "如需全量重跑，也可以删除或重命名缓存文件。"
         ),
     )
 
@@ -364,7 +366,7 @@ def main() -> int:
     except ImportError as exc:
         log_cb(f"[错误] 导入业务模块失败：{exc}")
         log_cb("请确认 word_freq_analyzer.py 与本脚本在同一目录，且依赖已安装：")
-        log_cb("  pip install pandas openpyxl xlrd jieba openai")
+        log_cb("  pip install pandas openpyxl xlrd jieba openai xlsxwriter")
         return 2
 
     # ── 加载词典 ─────────────────────────────────────────────────────────────
@@ -393,7 +395,7 @@ def main() -> int:
             return 2
 
     log_cb("正在扫描数据文件…")
-    files, ext_counts, scan_warnings = collect_data_files(args.data_dirs)
+    files, dir_counts, scan_warnings = collect_data_files(args.data_dirs)
     for w in scan_warnings:
         log_cb(f"[警告] {w}")
     if not files:
@@ -401,8 +403,8 @@ def main() -> int:
         log_cb(f"已扫描目录：{args.data_dirs}")
         return 2
 
-    ext_summary = "  ".join(f"{ext}: {n}" for ext, n in sorted(ext_counts.items()))
-    log_cb(f"共找到 {len(files)} 个文件（{ext_summary}）")
+    dir_summary = "  ".join(f"{directory}: {n}" for directory, n in sorted(dir_counts.items()))
+    log_cb(f"共找到 {len(files)} 个文件（按目录：{dir_summary or '未统计'}）")
 
     # ── 确保输出目录存在 ──────────────────────────────────────────────────────
     output_path = args.output

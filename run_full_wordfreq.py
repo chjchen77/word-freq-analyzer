@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import multiprocessing as mp
 import re
 import sys
@@ -34,8 +33,10 @@ def _init(terms: list[tuple[str, int, str]]) -> None:
     """worker 初始化：预编译整句预筛正则，避免对无命中句逐词搜索。"""
     global _TERMS, _PROBE
     _TERMS = terms
-    _PROBE = re.compile("|".join(
-        re.escape(t) for t, _, _ in sorted(terms, key=lambda x: -len(x[0]))))
+    _PROBE = re.compile(
+        "|".join(re.escape(t) for t, _, _ in sorted(terms, key=lambda x: -len(x[0]))),
+        flags=re.IGNORECASE,
+    )
 
 
 def _one_file(fp: str) -> tuple[dict | None, list[dict]]:
@@ -78,6 +79,8 @@ def main() -> None:
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--procs", type=int, default=max(1, mp.cpu_count() - 1))
     args = ap.parse_args()
+    if args.procs < 1:
+        raise SystemExit("--procs 必须是正整数。")
 
     d = pd.read_excel(args.dict, sheet_name="词典")[["term", "tier", "tier_name"]].dropna(subset=["term"])
     d["term"] = d["term"].astype(str).str.strip()
@@ -85,7 +88,9 @@ def main() -> None:
     terms = [(r.term, int(r.tier), r.tier_name) for r in d.itertuples()]
     tier_of = {t: tr for t, tr, _ in terms}
 
-    files = sorted(glob.glob(f"{args.mda_root}/*/*.txt"))
+    files = sorted(
+        str(path) for path in Path(args.mda_root).rglob("*.txt") if path.is_file()
+    )
     print(f"词典 {len(terms)} 词｜MD&A 文件 {len(files):,} 份｜进程 {args.procs}", flush=True)
 
     t0 = time.time()
@@ -105,9 +110,29 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     # ---- 命中句明细（LLM 打分的唯一输入）----
-    hit_df = pd.DataFrame(hits).drop_duplicates(
-        subset=["公司代码", "年份", "命中关键词", "命中句子"])
+    hit_columns = ["公司代码", "年份", "命中关键词", "分类", "命中句子"]
+    hit_df = pd.DataFrame(hits, columns=hit_columns)
+    if not hit_df.empty:
+        hit_df = hit_df.drop_duplicates(
+            subset=["公司代码", "年份", "命中关键词", "命中句子"]
+        )
     hit_df.to_excel(out / "命中句明细.xlsx", index=False)
+
+    if not rows:
+        # 没有合法 MDA 文件时仍输出带表头的空结果，不让后续列运算触发
+        # KeyError，并明确告诉用户是“没有有效输入”而不是程序崩溃。
+        panel_columns = ["公司代码", "年份", "mda_sent"]
+        for term, _, _ in terms:
+            if term not in panel_columns:
+                panel_columns.append(term)
+        panel_columns.extend(["total_freq", "total_ratio"])
+        for tr in sorted({t for t in tier_of.values()}):
+            panel_columns.extend([f"t{tr}_freq", f"t{tr}_ratio"])
+        pd.DataFrame(columns=panel_columns).to_excel(out / "公司年份面板.xlsx", index=False)
+        print("\n未找到包含合法公司代码、年份和 MDA 正文的有效文件。")
+        print(f"  空面板已写入：{out / '公司年份面板.xlsx'}")
+        print(f"  命中句明细：{out / '命中句明细.xlsx'}")
+        return
 
     # ---- 公司-年份面板 ----
     panel = pd.DataFrame(rows).fillna(0)

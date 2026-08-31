@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-小样本测试：随机抽取 2022 年 20 份年报，跑气候相关词典，
-验证时态分析和定性定量分析的效果。
+小样本测试：随机抽取 20 份年报，跑气候相关词典，验证词频和命中句导出。
 """
 import random
 import sys
@@ -86,8 +85,6 @@ def main():
         use_regex=True,
         use_tf=False,
         export_sentences=True,
-        analyze_tense=True,
-        analyze_quant=True,
         analyze_llm=ENABLE_LLM,
         llm_model=LLM_MODEL,
         llm_base_url=LLM_BASE_URL,
@@ -99,28 +96,16 @@ def main():
     # 4. 读取结果并打印摘要
     import pandas as pd
     print("\n" + "="*60)
-    print("【Sheet4 命中句子 — 前 30 条】")
+    sentences_path = str(Path(os.path.splitext(OUTPUT_PATH)[0] + "_sentences.xlsx"))
+    print("【命中句子文件 — 前 30 条】")
     print("="*60)
     try:
-        df = pd.read_excel(OUTPUT_PATH, sheet_name="命中句子")
+        df = pd.read_excel(sentences_path, sheet_name="命中句子")
         print(f"共 {len(df)} 条命中句子\n")
 
-        # 时态分布
-        if "句子时态" in df.columns:
-            print("时态分布：")
-            print(df["句子时态"].value_counts().to_string())
-            print()
-
-        # 定性定量分布
-        if "定性定量" in df.columns:
-            print("定性定量分布：")
-            print(df["定性定量"].value_counts().to_string())
-            print()
-
-        # 交叉分布
-        if "句子时态" in df.columns and "定性定量" in df.columns:
-            print("时态 × 定性定量交叉：")
-            print(df.groupby(["句子时态", "定性定量"]).size().to_string())
+        if "LLM分析状态" in df.columns:
+            print("LLM 分析状态：")
+            print(df["LLM分析状态"].value_counts(dropna=False).to_string())
             print()
 
         # 打印前 30 条明细
@@ -128,7 +113,6 @@ def main():
         pd.set_option("display.width", 200)
         cols = [
             "公司代码", "年份", "分类", "命中关键词",
-            "句子时态", "定性定量",
             "LLM时间指向", "LLM语态", "LLM句子类型", "LLM确定性", "LLM量化属性", "LLM语气语调",
             "命中句子",
         ]

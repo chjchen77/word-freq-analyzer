@@ -281,7 +281,14 @@ def main() -> None:
     output_path = Path(args.output).expanduser().resolve()
     excel_output_path = Path(args.excel_output).expanduser().resolve() if args.excel_output else None
 
-    files = sorted(src_root.rglob("*.txt"))
+    excluded_paths = {output_path}
+    if excel_output_path is not None:
+        excluded_paths.add(excel_output_path)
+    files = sorted(
+        p for p in src_root.rglob("*.txt")
+        if p.is_file()
+        and p.resolve() not in excluded_paths
+    )
     if args.limit > 0:
         files = files[:args.limit]
 

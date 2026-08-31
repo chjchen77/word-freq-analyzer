@@ -11,7 +11,7 @@
 
 v3.0 修复：
   - 修复子文件夹递归扫描遗漏 .xls 文件
-  - 新增大文件分块读取（CSV >100MB 自动分块）
+  - 新增大文件分块读取（xlsx 流式读取，CSV >100MB 自动分块）
   - 每文件处理后立即按 公司×年份 聚合，大幅降低内存占用
   - Sheet2 改用 melt() 向量化构建，大数据集速度提升 10x+
   - 修复 pandas 2.x infer_datetime_format 废弃警告
@@ -23,6 +23,9 @@ v3.0 修复：
 from __future__ import annotations
 
 import gc
+import csv
+import hashlib
+import json
 import os
 import re
 import sys
@@ -100,9 +103,20 @@ import pandas as pd
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".txt"}
 
 MAX_EXCEL_ROWS = 1_048_575  # Excel 行上限（减去表头）
-MAX_SENTENCES = 200_000
 BIG_CSV_THRESHOLD = 100 * 1024 * 1024  # 100MB
 CHUNK_ROWS = 50_000
+EXCEL_CHUNK_ROWS = 10_000
+
+DATA_ENCODINGS = (
+    "utf-8",
+    "utf-8-sig",
+    "gb18030",
+    "gbk",
+    "big5",
+    "utf-16",
+    "utf-16le",
+    "utf-16be",
+)
 
 DEFAULT_STOPWORDS = frozenset({
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
@@ -146,6 +160,88 @@ def _excel_cell_value(value):
     return value
 
 
+def _normalize_column_names(values) -> list[str]:
+    """把 Excel 原始表头规范成与 pandas 一致的、唯一的列名。"""
+    columns: list[str] = []
+    used: set[str] = set()
+    next_suffix: dict[str, int] = {}
+    for idx, value in enumerate(values):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            base = f"Unnamed: {idx}"
+        else:
+            base = str(value)
+            if not base.strip():
+                base = f"Unnamed: {idx}"
+
+        candidate = base
+        suffix = next_suffix.get(base, 0)
+        while candidate in used:
+            suffix += 1
+            candidate = f"{base}.{suffix}"
+        next_suffix[base] = suffix
+        used.add(candidate)
+        columns.append(candidate)
+    return columns
+
+
+def _detect_csv_separator(filepath: str, encoding: str) -> str:
+    """从 CSV 首段探测常见分隔符；探测失败时保持逗号默认值。"""
+    try:
+        with open(filepath, "r", encoding=encoding, errors="strict", newline="") as fh:
+            sample = fh.read(64 * 1024)
+        return csv.Sniffer().sniff(sample, delimiters=",\t;|").delimiter
+    except (OSError, UnicodeError, csv.Error):
+        return ","
+
+
+def _frame_from_excel_rows(rows: list[tuple], columns: list[str]) -> pd.DataFrame:
+    """将 openpyxl 流式读取的行转成与 dtype=str 相近的 DataFrame。"""
+    normalized_rows = []
+    width = len(columns)
+    for row in rows:
+        values = list(row[:width])
+        if len(values) < width:
+            values.extend([None] * (width - len(values)))
+        normalized_rows.append(values)
+    if not normalized_rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(normalized_rows, columns=columns).astype("string")
+
+
+def read_excel_chunked(filepath: str, chunksize: int = EXCEL_CHUNK_ROWS):
+    """以 openpyxl read_only 模式分块读取 .xlsx 的第一张工作表。
+
+    pandas.read_excel 默认读取第一张工作表，因此这里也固定使用第一张，
+    避免“预览/分析因活动工作表不同而读到另一张表”的隐性不一致。
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ValueError("读取 .xlsx 文件需要安装 openpyxl 库：pip install openpyxl") from exc
+
+    wb = load_workbook(filepath, read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0] if wb.worksheets else None
+        if ws is None:
+            return
+        rows = ws.iter_rows(values_only=True)
+        try:
+            raw_header = next(rows)
+        except StopIteration:
+            return
+        columns = _normalize_column_names(raw_header)
+        buffer: list[tuple] = []
+        for row in rows:
+            buffer.append(row)
+            if len(buffer) >= max(1, int(chunksize)):
+                yield _frame_from_excel_rows(buffer, columns)
+                buffer.clear()
+        if buffer:
+            yield _frame_from_excel_rows(buffer, columns)
+    finally:
+        wb.close()
+
+
 def write_dataframes_xlsx(path: str, sheets: list[tuple[str, pd.DataFrame]]) -> None:
     """
     Write DataFrames row-by-row so xlsxwriter constant_memory mode remains safe.
@@ -153,20 +249,41 @@ def write_dataframes_xlsx(path: str, sheets: list[tuple[str, pd.DataFrame]]) -> 
     pandas.to_excel can lose all but the first column when xlsxwriter is in
     constant_memory mode because cells are not emitted strictly row by row.
     """
-    import xlsxwriter
-
-    workbook = xlsxwriter.Workbook(path, {
-        "constant_memory": True,
-        "strings_to_urls": False,
-    })
     try:
+        import xlsxwriter
+    except ImportError as exc:
+        raise ValueError(
+            "缺少 xlsxwriter 依赖，无法写出 Excel。请先执行：pip install xlsxwriter"
+        ) from exc
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    workbook = None
+    try:
+        workbook = xlsxwriter.Workbook(str(temp_path), {
+            "constant_memory": True,
+            "strings_to_urls": False,
+        })
         for sheet_name, df in sheets:
             worksheet = workbook.add_worksheet(str(sheet_name)[:31])
             worksheet.write_row(0, 0, [str(c) for c in df.columns])
             for row_num, row in enumerate(df.itertuples(index=False, name=None), start=1):
                 worksheet.write_row(row_num, 0, [_excel_cell_value(v) for v in row])
-    finally:
         workbook.close()
+        workbook = None
+        os.replace(temp_path, output_path)
+    except Exception:
+        if workbook is not None:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 # ============================================================
 # 词典管理器
@@ -240,9 +357,14 @@ class DictionaryManager:
         df = pd.read_excel(path, header=None, dtype=str)
         if df.shape[1] < 2:
             raise ValueError("Excel 词典至少需要两列（分类、关键词）。")
-        for _, row in df.iterrows():
+        for row_idx, (_, row) in enumerate(df.iterrows()):
             cat = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
             word = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            if row_idx == 0 and (
+                cat.lower() in {"分类", "类别", "category", "cat", "tier_name"}
+                and word.lower() in {"关键词", "关键字", "词语", "keyword", "term", "word"}
+            ):
+                continue
             if cat and word:
                 self.add_category(cat)
                 self.add_word(cat, word)
@@ -373,7 +495,16 @@ def read_data_file(filepath: str, nrows=None) -> pd.DataFrame:
             except UnicodeDecodeError:
                 continue
         raise ValueError(f"无法读取文件（编码不支持）：{filepath}")
-    if ext in (".xlsx", ".xls"):
+    if ext == ".xlsx":
+        chunks = read_excel_chunked(
+            filepath,
+            chunksize=max(1, int(nrows)) if nrows is not None else EXCEL_CHUNK_ROWS,
+        )
+        if nrows is not None:
+            return next(chunks, pd.DataFrame())
+        parts = list(chunks)
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if ext == ".xls":
         try:
             return pd.read_excel(filepath, nrows=nrows, dtype=str)
         except ImportError:
@@ -384,10 +515,14 @@ def read_data_file(filepath: str, nrows=None) -> pd.DataFrame:
                 )
             raise
     # CSV
-    for enc in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5"):
+    for enc in DATA_ENCODINGS:
         try:
-            return pd.read_csv(filepath, nrows=nrows, dtype=str, encoding=enc, low_memory=False)
-        except (UnicodeDecodeError, pd.errors.ParserError):
+            sep = _detect_csv_separator(filepath, enc)
+            return pd.read_csv(
+                filepath, nrows=nrows, dtype=str, encoding=enc,
+                sep=sep, low_memory=False,
+            )
+        except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError):
             continue
     raise ValueError(f"无法读取文件（编码不支持）：{filepath}")
 
@@ -400,12 +535,14 @@ def read_csv_chunked(filepath: str, chunksize: int = CHUNK_ROWS):
     """
     # 第一步：探测正确的编码
     detected_enc = None
-    for enc in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5"):
+    for enc in DATA_ENCODINGS:
         try:
-            pd.read_csv(filepath, dtype=str, encoding=enc, nrows=100)
+            sep = _detect_csv_separator(filepath, enc)
+            pd.read_csv(filepath, dtype=str, encoding=enc, sep=sep, nrows=100)
             detected_enc = enc
+            detected_sep = sep
             break
-        except (UnicodeDecodeError, pd.errors.ParserError):
+        except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError):
             continue
     if detected_enc is None:
         raise ValueError(f"无法读取文件（编码不支持）：{filepath}")
@@ -413,7 +550,7 @@ def read_csv_chunked(filepath: str, chunksize: int = CHUNK_ROWS):
     # 第二步：用确定的编码分块读取
     reader = pd.read_csv(
         filepath, dtype=str, encoding=detected_enc,
-        low_memory=False, chunksize=chunksize,
+        sep=detected_sep, low_memory=False, chunksize=chunksize,
     )
     for chunk in reader:
         yield chunk
@@ -434,10 +571,9 @@ def _read_columns_fast(filepath: str) -> list[str]:
             try:
                 from openpyxl import load_workbook
                 wb = load_workbook(filepath, read_only=True, data_only=True)
-                ws = wb.active
+                ws = wb.worksheets[0] if wb.worksheets else None
                 for row in ws.iter_rows(max_row=1, values_only=True):
-                    cols = [str(c) if c is not None else f"Unnamed_{i}"
-                            for i, c in enumerate(row)]
+                    cols = _normalize_column_names(row)
                     wb.close()
                     return cols
                 wb.close()
@@ -451,16 +587,14 @@ def _read_columns_fast(filepath: str) -> list[str]:
         except Exception:
             return []
     # CSV: 只读第一行
-    for enc in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5"):
+    for enc in DATA_ENCODINGS:
         try:
-            df = pd.read_csv(filepath, nrows=0, dtype=str, encoding=enc)
+            sep = _detect_csv_separator(filepath, enc)
+            df = pd.read_csv(filepath, nrows=0, dtype=str, encoding=enc, sep=sep)
             return [str(c) for c in df.columns]
-        except Exception:
+        except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError):
             continue
     return []
-
-
-HEADER_SCAN_SIZE_LIMIT = 20 * 1024 * 1024  # 20MB: 跳过大 xlsx 的表头扫描（同目录小文件列相同）
 
 
 def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
@@ -468,21 +602,16 @@ def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
     扫描所有文件的列名（只读表头，不加载数据）。
     v3.0: 返回 (列名列表按出现频率降序, 列名→出现文件数)。
     频率高的列更可能是用户需要的公共列，优先展示。
-    对超过 50MB 的 xlsx 文件跳过扫描（同目录小文件列结构相同）。
+    .xlsx 文件使用 _read_columns_fast() 的 openpyxl read_only 模式读取第一行，
+    不因文件体积跳过表头扫描；否则单个大 Excel 会被误报为“发现 0 个数据列”。
     """
     col_freq: dict[str, int] = {}
-    skipped = 0
     for f in files:
         try:
             ext = Path(f).suffix.lower()
             if ext == ".txt":
                 for c in ["公司代码", "年份", "文本内容"]:
                     col_freq[c] = col_freq.get(c, 0) + 1
-                continue
-            fsize = os.path.getsize(f)
-            # 跳过巨大 xlsx（同目录的小文件结构相同）
-            if ext in (".xlsx", ".xls") and fsize > HEADER_SCAN_SIZE_LIMIT:
-                skipped += 1
                 continue
             columns = _read_columns_fast(f)
             for c in columns:
@@ -514,13 +643,11 @@ def parse_year_column(series: pd.Series) -> pd.Series:
 
     修复：原实现用 30% 阈值选策略；若三种策略均低于 30%，整列返回 0，
     导致有效年份行被全量丢弃（静默数据损失）。
-    新实现：对每种策略计算有效年份数，取最多的那种；只要找到 >=1 个有效年份
-    就使用该策略，无效行置 0 交由调用方过滤，不再静默丢弃整列。
+    新实现：按行合并多种解析策略，支持同一列内同时出现纯年份、日期、日期区间、
+    “2009年”和 Excel 序列日期；无法解析的行置 0 交由调用方过滤。
     """
     if series.empty:
         return pd.Series(dtype=int)
-
-    candidates: list[pd.Series] = []
 
     # 年报合理年份范围：1990–2030。
     # 1900 是 Excel 零值日期（NaT → 1900-01-01）的常见误解析结果；
@@ -530,25 +657,44 @@ def parse_year_column(series: pd.Series) -> pd.Series:
     # 策略 1：直接数值
     numeric = pd.to_numeric(series, errors="coerce")
     valid_mask = numeric.between(_YEAR_MIN, _YEAR_MAX)
-    candidates.append(numeric.where(valid_mask, 0).astype(int))
+    direct_years = numeric.where(valid_mask, 0).fillna(0).astype(int)
 
-    # 策略 2：日期解析（v3.0: 移除废弃的 infer_datetime_format）
+    # 策略 2：日期解析。utc=True 保证混合格式/时区时仍返回可用的
+    # Datetime Series，避免 .dt 在 object Series 上直接崩溃。
+    date_strings = series.astype("string").str.strip()
+    # 纯数字值优先按“年份/Excel 序列日期”解释，不送入日期解析，避免
+    # 45292 被 pandas 当成 1970 年的纳秒时间戳。
+    date_parse_input = date_strings.mask(numeric.notna())
     try:
-        dates = pd.to_datetime(series, errors="coerce", format="mixed")
+        dates = pd.to_datetime(
+            date_parse_input, errors="coerce", format="mixed", utc=True,
+        )
     except (ValueError, TypeError):
-        dates = pd.to_datetime(series, errors="coerce")
+        dates = pd.to_datetime(date_parse_input, errors="coerce", utc=True)
     years = dates.dt.year
     valid_year_mask = years.between(_YEAR_MIN, _YEAR_MAX)
-    candidates.append(years.where(valid_year_mask, 0).fillna(0).astype(int))
+    date_years = years.where(valid_year_mask, 0).fillna(0).astype(int)
 
-    # 策略 3：正则提取 4 位年份，同样只保留合理范围内的值
-    extracted = series.astype(str).str.extract(r"((?:19|20)\d{2})", expand=False)
+    # 策略 3：Excel 序列日期（例如 45292 对应 2024 年）。
+    excel_dates = pd.to_datetime(
+        numeric, unit="D", origin="1899-12-30", errors="coerce", utc=True,
+    )
+    excel_years = excel_dates.dt.year
+    excel_valid_mask = excel_years.between(_YEAR_MIN, _YEAR_MAX)
+    excel_years = excel_years.where(excel_valid_mask, 0).fillna(0).astype(int)
+
+    # 策略 4：正则提取 4 位年份，支持“2009年”、日期区间和多日期。
+    extracted = date_strings.str.extract(r"((?:19|20)\d{2})", expand=False)
     extracted_num = pd.to_numeric(extracted, errors="coerce")
     valid_regex_mask = extracted_num.between(_YEAR_MIN, _YEAR_MAX)
-    candidates.append(extracted_num.where(valid_regex_mask, 0).fillna(0).astype(int))
+    regex_years = extracted_num.where(valid_regex_mask, 0).fillna(0).astype(int)
 
-    # 取有效年份（非 0）最多的策略；若均为 0 则返回全 0
-    return max(candidates, key=lambda s: int((s > 0).sum()))
+    # 按行优先采用最直接的解释，再回退到日期、Excel 序列日期和正则提取。
+    # 与“整列择一策略”相比，不会因少数混合格式行被错误丢弃。
+    result = direct_years
+    for candidate in (date_years, excel_years, regex_years):
+        result = result.where(result > 0, candidate)
+    return result.astype(int)
 
 
 # 分句逻辑统一收敛到 sentence_split，避免与 count_mda_sentences 各存副本后漂移
@@ -600,7 +746,32 @@ def _process_one_file(
     ext = Path(fpath).suffix.lower()
     file_size = os.path.getsize(fpath)
 
-    if ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
+    if ext == ".xlsx":
+        file_chunks: list = []
+        file_sents: list = []
+        file_rows = file_hits = file_dropped = chunk_num = 0
+        for chunk_df in read_excel_chunked(fpath, EXCEL_CHUNK_ROWS):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            chunk_num += 1
+            result, rows, hits, sents, dropped = _process_chunk(
+                chunk_df, col_stkcd, col_year, text_columns,
+                keywords, use_regex, all_dict_words,
+                stopwords, use_stopwords, export_sentences, word_to_cat,
+            )
+            if result is not None:
+                file_chunks.append(result)
+                file_rows += rows
+                file_hits += hits
+                file_sents.extend(sents)
+                file_dropped += dropped
+        if file_chunks:
+            merged = pd.concat(file_chunks, ignore_index=True)
+            merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+            dropped_note = f"（{file_dropped}行年份无效）" if file_dropped else ""
+            return [merged], file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
+        return [], [], f"{display_name}  跳过：无有效数据"
+    elif ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
         file_chunks: list = []
         file_sents: list = []
         file_rows = file_hits = file_dropped = chunk_num = 0
@@ -834,6 +1005,34 @@ def run_analysis(
     # 之前设 20 万上限会导致大规模语料（>20 万命中）无法完整导出句子，已移除。
     sentence_cap = 0
 
+    # 用户可能把输出路径选在数据目录内；再次运行时必须排除上一次产生的
+    # 结果 Excel、完整句子 CSV、断点 CSV 和超大结果目录，避免把结果反读成输入。
+    _output_stem = os.path.splitext(output_path)[0]
+    _excluded_files = {
+        os.path.abspath(output_path),
+        os.path.abspath(_output_stem + "_sentences.xlsx"),
+        os.path.abspath(_output_stem + "_sentences_full.csv"),
+    }
+    _excluded_dirs = {
+        os.path.abspath(_output_stem + "_checkpoint"),
+        os.path.abspath(_output_stem + "_csv"),
+    }
+
+    def _path_in_dir(path: str, directory: str) -> bool:
+        try:
+            return os.path.commonpath([os.path.abspath(path), directory]) == directory
+        except ValueError:
+            return False
+
+    _input_files_before_filter = len(files)
+    files = [
+        f for f in files
+        if os.path.abspath(f) not in _excluded_files
+        and not any(_path_in_dir(f, d) for d in _excluded_dirs)
+    ]
+    if len(files) != _input_files_before_filter:
+        log(f"已排除输出目录中的 {_input_files_before_filter - len(files)} 个旧结果文件，避免重复分析。")
+
     # v3.0: 跨分类重复关键词警告（同一词在多个分类中只会归入最后一个分类）
     duplicates = dict_mgr.find_duplicates()
     if duplicates:
@@ -862,6 +1061,13 @@ def run_analysis(
     if bad_cats:
         log(f"警告：以下分类名与系统保留列名冲突，已自动跳过：{bad_cats}")
         categories = [c for c in categories if c not in _reserved]
+        bad_cat_kws = [kw for kw in keywords if word_to_cat.get(kw) in bad_cats]
+        if bad_cat_kws:
+            log(f"警告：属于冲突分类的关键词也已跳过：{bad_cat_kws[:20]}")
+            keywords = [kw for kw in keywords if kw not in bad_cat_kws]
+            all_dict_words.difference_update(bad_cat_kws)
+    valid_categories = set(categories)
+    word_to_cat = {kw: cat for kw, cat in word_to_cat.items() if cat in valid_categories}
     # 过滤后若关键词全部被移除，给出明确的参数错误（而非后续聚合时的"无文件"误导）
     if not keywords:
         raise ValueError(
@@ -897,39 +1103,99 @@ def run_analysis(
 
     # ── 断点检查点（Checkpoint）──────────────────────────────────────────────
     # 每处理 _CKPT_INTERVAL 个文件写一次断点；进程崩溃后可从断点续跑，不丢数据。
+    # 断点同时绑定输入文件、列配置、词典和匹配参数，避免用户改了设置后
+    # 误复用旧结果。
     _CKPT_INTERVAL  = 5000
     _ckpt_dir       = os.path.splitext(output_path)[0] + "_checkpoint"
     _ckpt_chunks_path = os.path.join(_ckpt_dir, "chunks.csv")
     _ckpt_sents_path  = os.path.join(_ckpt_dir, "sentences.csv")
     _ckpt_done_path   = os.path.join(_ckpt_dir, "done_files.txt")
+    _ckpt_meta_path   = os.path.join(_ckpt_dir, "metadata.json")
+
+    _checkpoint_files = []
+    for _f in sorted(files):
+        try:
+            _st = os.stat(_f)
+            _checkpoint_files.append({
+                "path": os.path.abspath(_f),
+                "size": _st.st_size,
+                "mtime_ns": _st.st_mtime_ns,
+            })
+        except OSError:
+            _checkpoint_files.append({"path": os.path.abspath(_f), "missing": True})
+    _checkpoint_payload = {
+        "files": _checkpoint_files,
+        "col_stkcd": col_stkcd,
+        "col_year": col_year,
+        "text_columns": list(text_columns),
+        "dictionary": {cat: list(dict_mgr.words(cat)) for cat in categories},
+        "keywords": list(keywords),
+        "use_regex": bool(use_regex),
+        "use_stopwords": bool(use_stopwords),
+        "stopwords": sorted(stopwords or []),
+        "use_tf": bool(use_tf),
+        "export_sentences": bool(export_sentences),
+        "analysis_workers": int(analysis_workers),
+        "jieba_userdict": os.path.abspath(jieba_userdict) if jieba_userdict else "",
+        "analyze_llm": bool(analyze_llm),
+        "llm_model": llm_model,
+        "llm_base_url": llm_base_url,
+        "llm_max_sentences": int(llm_max_sentences),
+        "llm_max_workers": int(llm_max_workers),
+        "llm_max_retries": int(llm_max_retries),
+        "llm_cache_path": os.path.abspath(llm_cache_path) if llm_cache_path else "",
+        "llm_system_prompt": llm_system_prompt or "",
+    }
+    _checkpoint_signature = hashlib.sha1(
+        json.dumps(_checkpoint_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
 
     _resume_done_set: set[str] = set()
+    _checkpoint_usable = False
     try:
         if os.path.isfile(_ckpt_done_path):
-            with open(_ckpt_done_path, "r", encoding="utf-8") as _ckf:
-                _resume_done_set = {ln.strip() for ln in _ckf if ln.strip()}
-            log(f"⚡ 发现断点记录，已完成 {len(_resume_done_set)} 个文件，将从断点续跑。")
-            if os.path.isfile(_ckpt_chunks_path):
-                _ck_df = pd.read_csv(_ckpt_chunks_path, dtype={"公司代码": str, "年份": str})
-                for _kc in [c for c in _ck_df.columns if c not in ("公司代码", "年份")]:
-                    _ck_df[_kc] = pd.to_numeric(_ck_df[_kc], errors="coerce").fillna(0).astype(int)
-                all_chunks.append(_ck_df)
-                log(f"  已加载断点 chunks：{len(_ck_df)} 行")
-                del _ck_df
-            if os.path.isfile(_ckpt_sents_path):
-                _sk_df = pd.read_csv(_ckpt_sents_path)
-                hit_sentences.extend(_sk_df.to_dict("records"))
-                log(f"  已加载断点句子：{len(hit_sentences)} 条")
-                del _sk_df
-                if sentence_cap > 0 and len(hit_sentences) >= sentence_cap:
-                    hit_sentences[:] = hit_sentences[:sentence_cap]
-            files = [f for f in files if f not in _resume_done_set]
-            log(f"  剩余待处理：{len(files)} 个文件（原始共 {total_files} 个）")
+            if os.path.isfile(_ckpt_meta_path):
+                with open(_ckpt_meta_path, "r", encoding="utf-8") as _mf:
+                    _saved_meta = json.load(_mf)
+                _checkpoint_usable = _saved_meta.get("signature") == _checkpoint_signature
+            if _checkpoint_usable:
+                with open(_ckpt_done_path, "r", encoding="utf-8") as _ckf:
+                    _resume_done_set = {ln.strip() for ln in _ckf if ln.strip()}
+                log(f"⚡ 发现匹配当前配置的断点记录，已完成 {len(_resume_done_set)} 个文件，将从断点续跑。")
+                if os.path.isfile(_ckpt_chunks_path):
+                    _ck_df = pd.read_csv(_ckpt_chunks_path, dtype={"公司代码": str, "年份": str})
+                    for _kc in [c for c in _ck_df.columns if c not in ("公司代码", "年份")]:
+                        _ck_df[_kc] = pd.to_numeric(_ck_df[_kc], errors="coerce").fillna(0).astype(int)
+                    all_chunks.append(_ck_df)
+                    log(f"  已加载断点 chunks：{len(_ck_df)} 行")
+                    del _ck_df
+                if os.path.isfile(_ckpt_sents_path):
+                    _sk_df = pd.read_csv(_ckpt_sents_path)
+                    hit_sentences.extend(_sk_df.to_dict("records"))
+                    log(f"  已加载断点句子：{len(hit_sentences)} 条")
+                    del _sk_df
+                    if sentence_cap > 0 and len(hit_sentences) >= sentence_cap:
+                        hit_sentences[:] = hit_sentences[:sentence_cap]
+                files = [f for f in files if f not in _resume_done_set]
+                log(f"  剩余待处理：{len(files)} 个文件（原始共 {total_files} 个）")
+            else:
+                log("⚠️  发现旧断点，但输入文件或分析配置已变化；旧断点已忽略，将从头分析。")
     except Exception as _ckpt_load_err:
         log(f"⚠️  断点加载失败，将从头开始：{_ckpt_load_err}")
         all_chunks.clear()
         hit_sentences.clear()
         _resume_done_set = set()
+
+    # 元数据单独原子写入；即使程序随后中断，也不会产生“无指纹旧断点”。
+    try:
+        os.makedirs(_ckpt_dir, exist_ok=True)
+        _tmp_meta = _ckpt_meta_path + ".tmp"
+        with open(_tmp_meta, "w", encoding="utf-8") as _mf:
+            json.dump({"signature": _checkpoint_signature, "payload": _checkpoint_payload},
+                      _mf, ensure_ascii=False, indent=2, default=str)
+        os.replace(_tmp_meta, _ckpt_meta_path)
+    except Exception as _meta_err:
+        log(f"⚠️  断点元数据保存失败（不影响分析）：{_meta_err}")
 
     _already_done: int = len(_resume_done_set)
     _ckpt_done_list: list[str] = list(_resume_done_set)
@@ -938,16 +1204,20 @@ def run_analysis(
         """将当前进度（all_chunks / hit_sentences / 完成文件列表）原子写入断点目录。"""
         try:
             os.makedirs(_ckpt_dir, exist_ok=True)
-            # 写 chunks（先 concat 再覆盖）
+            # chunks / sentences / done_files 都采用临时文件 + 原子替换，避免
+            # 进程中断时出现“完成列表是新的、数据文件却只写了一半”的断点。
             if all_chunks:
                 _tmp_c = pd.concat(all_chunks, ignore_index=True)
-                _tmp_c.to_csv(_ckpt_chunks_path, index=False, encoding="utf-8-sig")
+                _tmp_chunks_path = _ckpt_chunks_path + ".tmp"
+                _tmp_c.to_csv(_tmp_chunks_path, index=False, encoding="utf-8-sig")
+                os.replace(_tmp_chunks_path, _ckpt_chunks_path)
                 del _tmp_c
-            # 写 sentences
             if hit_sentences:
+                _tmp_sents_path = _ckpt_sents_path + ".tmp"
                 pd.DataFrame(hit_sentences).to_csv(
-                    _ckpt_sents_path, index=False, encoding="utf-8-sig"
+                    _tmp_sents_path, index=False, encoding="utf-8-sig"
                 )
+                os.replace(_tmp_sents_path, _ckpt_sents_path)
             # 原子写 done_files（先写 .tmp 再 rename，防止写到一半崩溃）
             _tmp_done = _ckpt_done_path + ".tmp"
             with open(_tmp_done, "w", encoding="utf-8") as _f2:
@@ -971,6 +1241,7 @@ def run_analysis(
             rel_dir = os.path.basename(os.path.dirname(fpath))
             display_name = f"{rel_dir}/{fname}" if rel_dir else fname
             log(f"[{idx}/{total_files}] {display_name}")
+            _file_succeeded = False
             try:
                 chunks, sents, msg = _process_one_file(
                     fpath, col_stkcd, col_year, text_columns,
@@ -985,11 +1256,13 @@ def run_analysis(
                     hit_sentences[:] = hit_sentences[:sentence_cap]
                     do_export_sentences = False
                     log("  命中句子已达上限，后续跳过提取。")
+                _file_succeeded = True
             except Exception as e:
                 log(f"  跳过（错误）：{e}")
-            # 断点追踪：无论成功/报错都记录此文件已处理
-            _ckpt_done_list.append(fpath)
-            if len(_ckpt_done_list) % _CKPT_INTERVAL == 0:
+            # 只有成功完成的文件才加入断点；错误文件必须允许下次重试。
+            if _file_succeeded:
+                _ckpt_done_list.append(fpath)
+            if _file_succeeded and len(_ckpt_done_list) % _CKPT_INTERVAL == 0:
                 _save_checkpoint_now(f"{len(_ckpt_done_list)}/{total_files}")
                 # 压缩 all_chunks → 单 DataFrame，减少下次 concat 开销
                 if len(all_chunks) > 1:
@@ -1030,6 +1303,7 @@ def run_analysis(
                 idx, fpath = future_map[future]
                 completed += 1
                 _disp = completed + _already_done  # 显示时加上已跳过的断点文件数
+                _file_succeeded = False
                 try:
                     chunks, sents, msg = future.result()
                     log(f"[{_disp}/{total_files}] {msg}")
@@ -1042,11 +1316,13 @@ def run_analysis(
                                     hit_sentences[:] = hit_sentences[:sentence_cap]
                                     _sent_capped.set()
                                     log("  命中句子已达上限，后续不再提取。")
+                    _file_succeeded = True
                 except Exception as e:
                     log(f"[{_disp}/{total_files}] 跳过（错误）：{e}")
-                # 断点追踪（主线程串行处理 future，无需额外加锁）
-                _ckpt_done_list.append(fpath)
-                if len(_ckpt_done_list) % _CKPT_INTERVAL == 0:
+                # 只有成功完成的 future 才能续跑跳过；异常文件下次重试。
+                if _file_succeeded:
+                    _ckpt_done_list.append(fpath)
+                if _file_succeeded and len(_ckpt_done_list) % _CKPT_INTERVAL == 0:
                     _save_checkpoint_now(f"{len(_ckpt_done_list)}/{total_files}")
                     # 压缩 all_chunks，减少下次 concat 开销
                     if len(all_chunks) > 1:
@@ -1169,7 +1445,7 @@ def run_analysis(
     log("正在写入词频结果 Excel…")
     _explain_rows = [
         {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
-        {"项目": "Sheet4 命中句子", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，Sheet1计N次，但Sheet4仅记录该句子一次。"},
+        {"项目": "独立命中句子文件", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，主表计N次，但句子文件仅记录该句子一次。"},
         {"项目": "分类占比列（_占比）", "说明": "= 该分类出现次数 / 该行所有分类出现次数之和。这是分类构成比，不是传统TF词频（词频/文档总词数）。"},
         {"项目": "LLM分析维度", "说明": "LLM时间指向/语态/句子类型/确定性/量化属性/语气均基于关键词所在句子的语义判断，temperature=0确保可复现。"},
         {"项目": "重复关键词处理", "说明": "同一关键词出现在多个分类时，仅归入词典中最后定义的分类。详见【词典诊断】sheet。"},
@@ -1315,7 +1591,7 @@ def run_analysis(
     log(f"Sheet2: 关键词明细 ({_n_sheet2} 行)")
     log(f"Sheet3: 分类汇总 ({_n_sheet3} 行)")
     if sheet4_rows:
-        log(f"Sheet4: 命中句子 ({sheet4_rows} 条，详见 {os.path.basename(_sent_path)})")
+        log(f"独立命中句子文件：{sheet4_rows} 条（详见 {os.path.basename(_sent_path)}）")
     if _llm_status_dict is not None:
         status_text = ", ".join(f"{k}={v}" for k, v in _llm_status_dict.items())
         log(f"LLM 句子分析状态：{status_text}")
@@ -1820,7 +2096,7 @@ class WordFreqApp(tk.Tk):
         row_out2.pack(fill="x", padx=8, pady=(2, 4))
         ttk.Checkbutton(
             row_out2, variable=self.var_sentences,
-            text="导出命中句子  （提取含关键词的原文句子到 Sheet4，用于论文引用验证，大数据集较慢）"
+            text="导出命中句子  （提取含关键词的原文句子到独立 _sentences.xlsx，用于论文引用验证，大数据集较慢）"
         ).pack(side="left")
 
         # ── 停用词 ───────────────────────────────────────────────────
@@ -1904,7 +2180,7 @@ class WordFreqApp(tk.Tk):
         model_row.grid(row=2, column=1, sticky="ew", pady=3)
         ttk.Entry(model_row, textvariable=self.llm_model_var, width=24).pack(
             side="left", padx=(0, 8))
-        ttk.Label(model_row, text="如：qwen-turbo / qwen-plus / qwen-max / gpt-4o-mini",
+        ttk.Label(model_row, text="如：qwen3.7-max / qwen-plus / qwen-max / gpt-4o-mini",
                   foreground="#666666").pack(side="left")
         ttk.Button(model_row, text="测试连接",
                    command=self._test_llm_connection).pack(side="right")
@@ -2061,7 +2337,7 @@ class WordFreqApp(tk.Tk):
             err_msg = ""
             if errors:
                 err_msg = "\n\n扫描错误：\n" + "\n".join(errors[:5])
-            messagebox.showinfo("提示", f"未找到 .xlsx / .xls / .csv 文件。{err_msg}")
+            messagebox.showinfo("提示", f"未找到 .xlsx / .xls / .csv / .txt 文件。{err_msg}")
             return
 
         # v3.0: 后台线程扫描列名（大 xlsx 读取慢，避免冻结 UI）
@@ -2096,7 +2372,10 @@ class WordFreqApp(tk.Tk):
             self._col_display_map[label] = c
 
         # v3.0: 按频率加权的自动列匹配
-        stkcd_patterns = ("股票代码", "证券代码", "公司代码", "stkcd", "stock_code", "scode", "code")
+        stkcd_patterns = (
+            "股票代码", "证券代码", "公司代码", "companyid", "company_id",
+            "企业id", "企业编号", "stkcd", "stock_code", "scode", "code",
+        )
         year_patterns = ("年份", "year", "年", "日期", "时间", "date", "qtm")
 
         def _best_match(patterns):
@@ -2570,6 +2849,13 @@ class WordFreqApp(tk.Tk):
             messagebox.showwarning("提示", "请在「分析设置」选择输出路径。")
             return
 
+        # 在锁定界面前完成所有参数校验，否则输入错误会让按钮停留在禁用状态。
+        try:
+            analysis_workers_val = max(1, int(self.analysis_workers_var.get().strip() or "1"))
+        except ValueError:
+            messagebox.showwarning("提示", "并发进程数必须是正整数。")
+            return
+
         llm_max_sentences = 500
         llm_max_workers = 4
         llm_max_retries = 2
@@ -2629,13 +2915,6 @@ class WordFreqApp(tk.Tk):
         def log_with_status(msg):
             self._log(msg)
             self._set_current_file(msg)
-
-        # 并发进程数单独验证（在 kwargs 之外，保证异常能被捕获并提示用户）
-        try:
-            analysis_workers_val = max(1, int(self.analysis_workers_var.get().strip() or "1"))
-        except ValueError:
-            messagebox.showwarning("提示", "并发进程数必须是正整数。")
-            return
 
         kwargs = dict(
             files=list(self.scanned_files),
