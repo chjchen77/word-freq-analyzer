@@ -37,12 +37,19 @@ jobs:
 
       - name: Create distributable zip
         shell: pwsh
-        run: Compress-Archive -Path 'dist/词频统计分析工具' -DestinationPath '词频统计分析工具-Windows.zip' -Force
+        run: |
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE 'windows-build.zip'
+          $appPath = Join-Path $env:GITHUB_WORKSPACE 'dist/词频统计分析工具'
+          Compress-Archive -LiteralPath $appPath -DestinationPath $zipPath -Force
+          if (-not (Test-Path -LiteralPath $zipPath)) {
+            throw "Windows package was not created: $zipPath"
+          }
+          Get-Item -LiteralPath $zipPath | Select-Object FullName, Length
 
       - name: Upload Windows zip
         uses: actions/upload-artifact@v4
         with:
-          name: 词频统计分析工具-Windows
-          path: 词频统计工具-Windows.zip
+          name: windows-build
+          path: windows-build.zip
           if-no-files-found: error
           retention-days: 30
