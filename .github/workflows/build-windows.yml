@@ -1,0 +1,48 @@
+name: Build Windows application
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.py'
+      - '**.bat'
+      - 'requirements.txt'
+      - 'Windows使用说明.txt'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build application
+        shell: cmd
+        run: build_windows.bat
+
+      - name: Add Windows instructions
+        shell: pwsh
+        run: Copy-Item -LiteralPath 'Windows使用说明.txt' -Destination 'dist/词频统计分析工具/Windows使用说明.txt'
+
+      - name: Create distributable zip
+        shell: pwsh
+        run: Compress-Archive -Path 'dist/词频统计分析工具' -DestinationPath '词频统计分析工具-Windows.zip' -Force
+
+      - name: Upload Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: 词频统计分析工具-Windows
+          path: 词频统计工具-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
