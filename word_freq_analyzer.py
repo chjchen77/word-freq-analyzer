@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-中文文本词频统计分析工具 v4.0
+中文文本词频统计分析工具 v4.1
 ==============================
-科研级面板数据词频统计。输出 公司×年份 面板数据格式。
+科研级中文文本词频统计。默认逐条保留原始记录，并从日期中识别年份和月份。
 支持分类词典管理、正则/jieba 双模式、命中句子导出。
 
 作者：陈浩杰
@@ -12,7 +12,7 @@
 v3.0 修复：
   - 修复子文件夹递归扫描遗漏 .xls 文件
   - 新增大文件分块读取（xlsx 流式读取，CSV >100MB 自动分块）
-  - 每文件处理后立即按 公司×年份 聚合，大幅降低内存占用
+  - 支持逐条保留原始记录（默认）或按 公司×年份 聚合
   - Sheet2 改用 melt() 向量化构建，大数据集速度提升 10x+
   - 修复 pandas 2.x infer_datetime_format 废弃警告
   - 新增取消按钮，分析可随时中止
@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import threading
+from datetime import date, datetime
 # tkinter 仅 GUI 模式需要；服务器/CLI 模式下可无 tkinter 正常运行核心功能
 try:
     import tkinter as tk
@@ -697,6 +698,74 @@ def parse_year_column(series: pd.Series) -> pd.Series:
     return result.astype(int)
 
 
+def parse_month_column(series: pd.Series) -> pd.Series:
+    """从日期列提取月份；只有纯年份或无法确定月份时返回 0。
+
+    支持普通日期、中文日期（2024年3月15日）、Excel 序列日期和日期区间。
+    日期区间取其中第一个明确日期的月份，原始日期文本仍会完整写入结果。
+    """
+    if series.empty:
+        return pd.Series(dtype=int)
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    date_strings = series.astype("string").str.strip()
+    normalized = (
+        date_strings
+        .str.replace("年", "-", regex=False)
+        .str.replace("月", "-", regex=False)
+        .str.replace("日", "", regex=False)
+    )
+    # “2024年”只表示年份，不能被 pandas 默认补成 2024-01；月份应保持未知。
+    year_only_mask = normalized.str.fullmatch(r"(?:19|20)\d{2}-?")
+    date_parse_input = normalized.mask(numeric.notna() | year_only_mask)
+    try:
+        dates = pd.to_datetime(
+            date_parse_input, errors="coerce", format="mixed", utc=True,
+        )
+    except (ValueError, TypeError):
+        dates = pd.to_datetime(date_parse_input, errors="coerce", utc=True)
+    years = dates.dt.year
+    date_months = dates.dt.month.where(
+        years.between(1990, 2030), 0
+    ).fillna(0).astype(int)
+
+    # 仅把合理范围内的数字当作 Excel 序列日期，避免把“2024”误读成 1905 年。
+    excel_numeric = numeric.where(numeric.between(20_000, 60_000))
+    excel_dates = pd.to_datetime(
+        excel_numeric, unit="D", origin="1899-12-30", errors="coerce", utc=True,
+    )
+    excel_months = excel_dates.dt.month.fillna(0).astype(int)
+
+    # 日期解析失败时，从“2024年3月”“2024/3/15”等文本提取月份。
+    extracted = normalized.str.extract(
+        r"(?:(?:19|20)\d{2})\D{1,3}(\d{1,2})", expand=False
+    )
+    regex_months = pd.to_numeric(extracted, errors="coerce")
+    regex_months = regex_months.where(regex_months.between(1, 12), 0).fillna(0).astype(int)
+
+    result = date_months
+    for candidate in (excel_months, regex_months):
+        result = result.where(result > 0, candidate)
+    return result.astype(int)
+
+
+def _format_date_value(value) -> str:
+    """将日期列值转换成适合写入结果表的显示文本，不丢失原始信息。"""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value).strftime("%Y-%m-%d")
+    text = str(value).strip()
+    numeric = pd.to_numeric(text, errors="coerce")
+    if pd.notna(numeric) and 20_000 <= numeric <= 60_000:
+        try:
+            return (pd.Timestamp("1899-12-30") + pd.to_timedelta(numeric, unit="D")) \
+                .strftime("%Y-%m-%d")
+        except (OverflowError, ValueError):
+            pass
+    return text
+
+
 # 分句逻辑统一收敛到 sentence_split，避免与 count_mda_sentences 各存副本后漂移
 # （分子=命中句、分母=MD&A句数，两者口径必须完全一致）。
 from sentence_split import (  # noqa: E402
@@ -731,6 +800,7 @@ def _process_one_file(
     export_sentences: bool,
     word_to_cat: dict[str, str],
     agg_rules: dict[str, str],
+    preserve_rows: bool,
     cancel_event,
 ) -> tuple[list, list, str]:
     """处理单个文件，返回 (chunks, sents, log_msg)，异常会向上抛出。
@@ -750,6 +820,7 @@ def _process_one_file(
         file_chunks: list = []
         file_sents: list = []
         file_rows = file_hits = file_dropped = chunk_num = 0
+        source_row_offset = 0
         for chunk_df in read_excel_chunked(fpath, EXCEL_CHUNK_ROWS):
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -758,7 +829,11 @@ def _process_one_file(
                 chunk_df, col_stkcd, col_year, text_columns,
                 keywords, use_regex, all_dict_words,
                 stopwords, use_stopwords, export_sentences, word_to_cat,
+                source_file=display_name,
+                source_row_offset=source_row_offset,
+                preserve_rows=preserve_rows,
             )
+            source_row_offset += len(chunk_df)
             if result is not None:
                 file_chunks.append(result)
                 file_rows += rows
@@ -766,15 +841,18 @@ def _process_one_file(
                 file_sents.extend(sents)
                 file_dropped += dropped
         if file_chunks:
-            merged = pd.concat(file_chunks, ignore_index=True)
-            merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+            if not preserve_rows:
+                merged = pd.concat(file_chunks, ignore_index=True)
+                merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+                file_chunks = [merged]
             dropped_note = f"（{file_dropped}行年份无效）" if file_dropped else ""
-            return [merged], file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
+            return file_chunks, file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
         return [], [], f"{display_name}  跳过：无有效数据"
     elif ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
         file_chunks: list = []
         file_sents: list = []
         file_rows = file_hits = file_dropped = chunk_num = 0
+        source_row_offset = 0
         for chunk_df in read_csv_chunked(fpath, CHUNK_ROWS):
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -783,7 +861,11 @@ def _process_one_file(
                 chunk_df, col_stkcd, col_year, text_columns,
                 keywords, use_regex, all_dict_words,
                 stopwords, use_stopwords, export_sentences, word_to_cat,
+                source_file=display_name,
+                source_row_offset=source_row_offset,
+                preserve_rows=preserve_rows,
             )
+            source_row_offset += len(chunk_df)
             if result is not None:
                 file_chunks.append(result)
                 file_rows += rows
@@ -791,10 +873,12 @@ def _process_one_file(
                 file_sents.extend(sents)
                 file_dropped += dropped
         if file_chunks:
-            merged = pd.concat(file_chunks, ignore_index=True)
-            merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+            if not preserve_rows:
+                merged = pd.concat(file_chunks, ignore_index=True)
+                merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+                file_chunks = [merged]
             dropped_note = f"（{file_dropped}行年份无效）" if file_dropped else ""
-            return [merged], file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
+            return file_chunks, file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
         return [], [], f"{display_name}  跳过：无有效数据"
     else:
         df = read_data_file(fpath)
@@ -802,6 +886,9 @@ def _process_one_file(
             df, col_stkcd, col_year, text_columns,
             keywords, use_regex, all_dict_words,
             stopwords, use_stopwords, export_sentences, word_to_cat,
+            source_file=display_name,
+            source_row_offset=0,
+            preserve_rows=preserve_rows,
         )
         del df
         if result is not None:
@@ -841,10 +928,15 @@ def _process_chunk(
     use_stopwords: bool,
     do_export_sentences: bool,
     word_to_cat: dict[str, str],
+    *,
+    source_file: str = "",
+    source_row_offset: int = 0,
+    preserve_rows: bool = False,
 ) -> tuple[pd.DataFrame | None, int, int, list[dict], int]:
     """
     处理单个 DataFrame（整文件或 CSV 块）。
-    返回 (聚合后的 公司×年份 DataFrame, 原始行数, 命中次数, 命中句子列表, 年份无效行数)。
+    返回 (结果 DataFrame, 原始行数, 命中次数, 命中句子列表, 年份无效行数)。
+    preserve_rows=True 时逐条保留原始记录；否则返回按公司×年份聚合的数据。
     """
     hit_sents: list[dict] = []
 
@@ -859,12 +951,16 @@ def _process_chunk(
 
     df = df.copy()
     raw_rows = len(df)  # v3.0: 在过滤前记录原始行数
+    df["_source_file"] = source_file
+    df["_source_row"] = range(source_row_offset + 2, source_row_offset + 2 + len(df))
     df["_stkcd"] = df[col_stkcd].apply(fix_stock_code)
     # 过滤空/无效公司代码，防止空字符串聚合成一条虚假"公司"记录污染面板
     _empty_stkcd_mask = df["_stkcd"].fillna("").str.strip() == ""
     if _empty_stkcd_mask.any():
         df = df[~_empty_stkcd_mask].copy()
     df["_year"] = parse_year_column(df[col_year])
+    df["_month"] = parse_month_column(df[col_year])
+    df["_date"] = df[col_year].map(_format_date_value)
     dropped_years = (df["_year"] == 0).sum()
     # 注意：_process_chunk 可在子进程中运行，log 不在作用域；年份警告由调用方汇总
     df = df[df["_year"] > 0].copy()  # v3.0: .copy() 防止 SettingWithCopyWarning
@@ -929,6 +1025,7 @@ def _process_chunk(
         for row_idx in df[match_mask].index:
             stkcd = df.loc[row_idx, "_stkcd"]
             year = int(df.loc[row_idx, "_year"])
+            month = int(df.loc[row_idx, "_month"])
             row_kws = [kw for kw in keywords if df.loc[row_idx, kw] > 0]
             if not row_kws:
                 continue
@@ -941,12 +1038,25 @@ def _process_chunk(
                         hit_sents.append({
                             "公司代码": stkcd,
                             "年份": year,
+                            "月份": month if month > 0 else "",
+                            "日期": df.loc[row_idx, "_date"],
+                            "来源文件": df.loc[row_idx, "_source_file"],
+                            "源文件行号": int(df.loc[row_idx, "_source_row"]),
                             "命中关键词": kw,
                             "分类": word_to_cat.get(kw, ""),
                             "命中句子": sent,
                         })
 
-    # 按 公司×年份 聚合（v3.0: 每文件/块立即聚合，大幅节省内存）
+    if preserve_rows:
+        # 逐条输出时保留日期、月份和源文件行号，确保相同公司同一天的多条记录也不合并。
+        chunk = df[["_stkcd", "_year", "_month", "_date",
+                    "_source_file", "_source_row"] + keywords].copy()
+        chunk.columns = ["公司代码", "年份", "月份", "日期", "来源文件", "源文件行号"] + keywords
+        chunk["月份"] = chunk["月份"].replace(0, pd.NA).astype("Int64")
+        chunk["源文件行号"] = pd.to_numeric(chunk["源文件行号"], errors="coerce").astype("Int64")
+        return chunk, raw_rows, n_hits, hit_sents, int(dropped_years)
+
+    # 兼容旧的公司×年份汇总模式。
     chunk = df[["_stkcd", "_year"] + keywords].copy()
     chunk.columns = ["公司代码", "年份"] + keywords
     agg_rules = {kw: "sum" for kw in keywords}
@@ -978,6 +1088,7 @@ def run_analysis(
     llm_cache_path: str | None = None,
     llm_system_prompt: str = "",
     analysis_workers: int = 1,
+    preserve_rows: bool = True,
     jieba_userdict: str = "",
     progress_cb=None,
     log_cb=None,
@@ -1051,7 +1162,10 @@ def run_analysis(
     )
 
     # v3.0: 列名碰撞检查 — 关键词/分类名不能与内部列名冲突
-    _reserved = {"公司代码", "年份", "总计", "_stkcd", "_year"}
+    _reserved = {
+        "公司代码", "年份", "月份", "日期", "来源文件", "源文件行号", "总计",
+        "_stkcd", "_year", "_month", "_date",
+    }
     bad_kws = [kw for kw in keywords if kw in _reserved]
     if bad_kws:
         log(f"警告：以下关键词与系统保留列名冲突，已自动跳过：{bad_kws}")
@@ -1091,7 +1205,11 @@ def run_analysis(
         log("匹配模式：jieba 分词")
 
     log(f"词典：{len(keywords)} 个关键词，{len(categories)} 个分类")
-    log(f"公司代码列：{col_stkcd}，年份列：{col_year}")
+    if preserve_rows:
+        log("统计方式：逐条保留原始记录，不按年份或月份汇总；结果包含日期和月份列。")
+    else:
+        log("统计方式：按公司代码×年份汇总。")
+    log(f"公司代码列：{col_stkcd}，日期/年份列：{col_year}")
     log(f"文本列：{', '.join(text_columns)}")
 
     all_chunks: list[pd.DataFrame] = []
@@ -1128,6 +1246,7 @@ def run_analysis(
         "col_stkcd": col_stkcd,
         "col_year": col_year,
         "text_columns": list(text_columns),
+        "preserve_rows": bool(preserve_rows),
         "dictionary": {cat: list(dict_mgr.words(cat)) for cat in categories},
         "keywords": list(keywords),
         "use_regex": bool(use_regex),
@@ -1164,8 +1283,12 @@ def run_analysis(
                 log(f"⚡ 发现匹配当前配置的断点记录，已完成 {len(_resume_done_set)} 个文件，将从断点续跑。")
                 if os.path.isfile(_ckpt_chunks_path):
                     _ck_df = pd.read_csv(_ckpt_chunks_path, dtype={"公司代码": str, "年份": str})
-                    for _kc in [c for c in _ck_df.columns if c not in ("公司代码", "年份")]:
+                    for _kc in [c for c in keywords if c in _ck_df.columns]:
                         _ck_df[_kc] = pd.to_numeric(_ck_df[_kc], errors="coerce").fillna(0).astype(int)
+                    if preserve_rows and "月份" in _ck_df.columns:
+                        _ck_df["月份"] = pd.to_numeric(_ck_df["月份"], errors="coerce").replace(0, pd.NA).astype("Int64")
+                    if preserve_rows and "源文件行号" in _ck_df.columns:
+                        _ck_df["源文件行号"] = pd.to_numeric(_ck_df["源文件行号"], errors="coerce").astype("Int64")
                     all_chunks.append(_ck_df)
                     log(f"  已加载断点 chunks：{len(_ck_df)} 行")
                     del _ck_df
@@ -1247,7 +1370,7 @@ def run_analysis(
                     fpath, col_stkcd, col_year, text_columns,
                     keywords, use_regex, all_dict_words,
                     stopwords, use_stopwords, do_export_sentences,
-                    word_to_cat, agg_rules, cancel_event,
+                    word_to_cat, agg_rules, preserve_rows, cancel_event,
                 )
                 log(f"  {msg.split('  ', 1)[-1]}" if "  " in msg else f"  {msg}")
                 all_chunks.extend(chunks)
@@ -1294,7 +1417,7 @@ def run_analysis(
                     fpath, col_stkcd, col_year, text_columns,
                     keywords, use_regex, _worker_dict_words,
                     stopwords, use_stopwords, export_sentences,
-                    word_to_cat, agg_rules, None,  # 子进程不传 cancel_event
+                    word_to_cat, agg_rules, preserve_rows, None,  # 子进程不传 cancel_event
                 ): (i + 1, fpath)
                 for i, fpath in enumerate(files)
             }
@@ -1346,20 +1469,34 @@ def run_analysis(
     if is_cancelled():
         raise ValueError("分析已被用户取消。")
 
-    # ---- 汇总 ----
+    # ---- 整理结果 ----
     if not all_chunks:
         raise ValueError("没有成功处理任何文件，请检查数据和列配置。")
 
-    log("正在汇总面板数据…")
+    log("正在整理分析结果…")
     combined = pd.concat(all_chunks, ignore_index=True)
     del all_chunks
     gc.collect()
 
-    panel = combined.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
-    del combined
-    gc.collect()
+    if preserve_rows:
+        # 新模式：不做任何公司/日期聚合，保留每一条有效原始记录。
+        panel = combined
+        id_cols = ["公司代码", "年份", "月份", "日期", "来源文件", "源文件行号"]
+        main_sheet_name = "原始记录统计"
+        keyword_sheet_name = "原始记录关键词"
+        sort_cols = [c for c in id_cols if c in panel.columns]
+        log(f"已保留 {len(panel):,} 条原始记录，未按年份或月份合并。")
+    else:
+        # 兼容旧模式：按公司×年份聚合。
+        panel = combined.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+        del combined
+        gc.collect()
+        id_cols = ["公司代码", "年份"]
+        main_sheet_name = "公司年份分类统计"
+        keyword_sheet_name = "关键词明细"
+        sort_cols = id_cols
 
-    panel.sort_values(["公司代码", "年份"], inplace=True)
+    panel.sort_values(sort_cols, inplace=True, kind="stable")
     panel.reset_index(drop=True, inplace=True)
 
     # v3.0: 提前构建分类→关键词映射快照（线程安全，不再依赖 dict_mgr）
@@ -1367,8 +1504,8 @@ def run_analysis(
     for cat in categories:
         cat_to_kws[cat] = [kw for kw in keywords if word_to_cat.get(kw) == cat]
 
-    # ---- Sheet1: 公司×年份 分类统计 ----
-    sheet1 = panel[["公司代码", "年份"]].copy()
+    # ---- Sheet1: 原始记录/公司×年份 分类统计 ----
+    sheet1 = panel[id_cols].copy()
     for cat in categories:
         cat_kws = [kw for kw in cat_to_kws.get(cat, []) if kw in panel.columns]
         sheet1[cat] = panel[cat_kws].sum(axis=1).astype(int) if cat_kws else 0
@@ -1378,10 +1515,10 @@ def run_analysis(
         for cat in categories:
             sheet1[f"{cat}_占比"] = (sheet1[cat] / total_per_row).round(6)
 
-    # ---- Sheet2: 公司×年份×关键词 明细（v3.0: 向量化 melt）----
+    # ---- Sheet2: 记录/公司×年份×关键词 明细（v3.0: 向量化 melt）----
     log("正在构建关键词明细…")
     sheet2 = panel.melt(
-        id_vars=["公司代码", "年份"],
+        id_vars=id_cols,
         value_vars=keywords,
         var_name="关键词",
         value_name="次数",
@@ -1389,7 +1526,7 @@ def run_analysis(
     sheet2["次数"] = sheet2["次数"].astype(int)
     sheet2 = sheet2[sheet2["次数"] > 0].copy()
     sheet2["分类"] = sheet2["关键词"].map(word_to_cat).fillna("")
-    sheet2.sort_values(["公司代码", "年份", "分类", "关键词"], inplace=True)
+    sheet2.sort_values(id_cols + ["分类", "关键词"], inplace=True, kind="stable")
     sheet2.reset_index(drop=True, inplace=True)
 
     # ---- Sheet3: 总体分类统计 ----
@@ -1430,8 +1567,8 @@ def run_analysis(
         csv_dir = os.path.splitext(output_path)[0] + "_csv"
         os.makedirs(csv_dir, exist_ok=True)
         log(f"数据量超过 Excel 行上限，正在先导出完整 CSV…")
-        sheet1.to_csv(os.path.join(csv_dir, "公司年份分类统计.csv"), index=False, encoding="utf-8-sig")
-        sheet2.to_csv(os.path.join(csv_dir, "关键词明细.csv"), index=False, encoding="utf-8-sig")
+        sheet1.to_csv(os.path.join(csv_dir, f"{main_sheet_name}.csv"), index=False, encoding="utf-8-sig")
+        sheet2.to_csv(os.path.join(csv_dir, f"{keyword_sheet_name}.csv"), index=False, encoding="utf-8-sig")
         sheet3.to_csv(os.path.join(csv_dir, "分类汇总.csv"), index=False, encoding="utf-8-sig")
         log(f"完整数据已保存至：{csv_dir}")
     if len(sheet1) > MAX_EXCEL_ROWS:
@@ -1444,7 +1581,8 @@ def run_analysis(
     # ---- 先写词频结果 Excel（LLM 开始前落盘，防止 OOM 崩溃导致数据全丢）----
     log("正在写入词频结果 Excel…")
     _explain_rows = [
-        {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
+        {"项目": "统计方式", "说明": "当前默认逐条保留每一条有效原始记录，不按公司、年份或月份合并；每条记录均保留日期、月份、来源文件和源文件行号。" if preserve_rows else "当前按公司代码×年份汇总；同一公司同一年内的多条记录会合并。"},
+        {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该条原始记录文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。" if preserve_rows else "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
         {"项目": "独立命中句子文件", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，主表计N次，但句子文件仅记录该句子一次。"},
         {"项目": "分类占比列（_占比）", "说明": "= 该分类出现次数 / 该行所有分类出现次数之和。这是分类构成比，不是传统TF词频（词频/文档总词数）。"},
         {"项目": "LLM分析维度", "说明": "LLM时间指向/语态/句子类型/确定性/量化属性/语气均基于关键词所在句子的语义判断，temperature=0确保可复现。"},
@@ -1454,8 +1592,8 @@ def run_analysis(
     # 第一步：只写主表格（不含命中句子）
     # 命中句子单独写入 _sentences.xlsx，避免大文件与大 DataFrame 同时驻留内存
     write_dataframes_xlsx(output_path, [
-        ("公司年份分类统计", sheet1),
-        ("关键词明细", sheet2),
+        (main_sheet_name, sheet1),
+        (keyword_sheet_name, sheet2),
         ("分类汇总", sheet3),
         ("词典诊断", sheet_dict_diag),
         ("分析说明", pd.DataFrame(_explain_rows)),
@@ -1586,9 +1724,10 @@ def run_analysis(
         del _sent_out
         gc.collect()
 
-    log(f"完成！{_n_sheet1} 条面板记录，{_n_companies} 家公司，年份 {_year_min}-{_year_max}")
-    log(f"Sheet1: 公司×年份 分类统计 ({_n_sheet1} 行)")
-    log(f"Sheet2: 关键词明细 ({_n_sheet2} 行)")
+    _result_label = "原始记录" if preserve_rows else "面板记录"
+    log(f"完成！{_n_sheet1} 条{_result_label}，{_n_companies} 家公司，年份 {_year_min}-{_year_max}")
+    log(f"Sheet1: {main_sheet_name} ({_n_sheet1} 行)")
+    log(f"Sheet2: {keyword_sheet_name} ({_n_sheet2} 行)")
     log(f"Sheet3: 分类汇总 ({_n_sheet3} 行)")
     if sheet4_rows:
         log(f"独立命中句子文件：{sheet4_rows} 条（详见 {os.path.basename(_sent_path)}）")
@@ -1778,7 +1917,7 @@ class WordFreqApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("中文文本词频统计分析工具 v4.0 — 陈浩杰 | 澳门城市大学金融学院")
+        self.title("中文文本词频统计分析工具 v4.1 — 陈浩杰 | 澳门城市大学金融学院")
         self.geometry("1020x800")
         self.resizable(True, True)
         self.minsize(880, 680)
@@ -1799,6 +1938,7 @@ class WordFreqApp(tk.Tk):
         self.stopwords_path = tk.StringVar()
         self.var_tf = tk.BooleanVar(value=False)
         self.var_sentences = tk.BooleanVar(value=False)
+        self.var_preserve_rows = tk.BooleanVar(value=True)
         self.analysis_workers_var = tk.StringVar(value="1")
         self.var_llm = tk.BooleanVar(value=False)
         self.llm_api_key_var = tk.StringVar(value=os.getenv("DASHSCOPE_API_KEY", ""))
@@ -1927,7 +2067,7 @@ class WordFreqApp(tk.Tk):
         self.combo_stkcd = ttk.Combobox(inner, state="readonly", width=18)
         self.combo_stkcd.grid(row=0, column=1, sticky="ew", pady=2)
 
-        ttk.Label(inner, text="年份/日期列：").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(inner, text="日期/年份列：").grid(row=1, column=0, sticky="w", pady=2)
         self.combo_year = ttk.Combobox(inner, state="readonly", width=18)
         self.combo_year.grid(row=1, column=1, sticky="ew", pady=2)
 
@@ -2084,6 +2224,18 @@ class WordFreqApp(tk.Tk):
         # ── 输出选项 ──────────────────────────────────────────────────
         frm_out_opts = ttk.LabelFrame(tab, text="输出选项")
         frm_out_opts.pack(fill="x", **pad)
+
+        row_out0 = ttk.Frame(frm_out_opts)
+        row_out0.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Checkbutton(
+            row_out0, variable=self.var_preserve_rows,
+            text="逐条保留原始记录（推荐，不按年份或月份汇总；输出包含日期、月份、来源文件和行号）"
+        ).pack(side="left")
+        ttk.Label(
+            frm_out_opts,
+            text="取消勾选后恢复旧模式：按公司代码×年份汇总。",
+            foreground="#666666",
+        ).pack(anchor="w", padx=28, pady=(0, 2))
 
         row_out1 = ttk.Frame(frm_out_opts)
         row_out1.pack(fill="x", padx=8, pady=(4, 2))
@@ -2437,7 +2589,7 @@ class WordFreqApp(tk.Tk):
         if best_stkcd:
             auto_info += f"\n  公司代码列 → {best_stkcd}"
         if best_year:
-            auto_info += f"\n  年份/日期列 → {best_year}"
+            auto_info += f"\n  日期/年份列 → {best_year}"
         if auto_text_indices:
             auto_text_names = [self._col_display_map[list(self._col_display_map.keys())[i]]
                                for i in auto_text_indices]
@@ -2827,7 +2979,7 @@ class WordFreqApp(tk.Tk):
             messagebox.showwarning("提示", "请在「数据选择」配置 公司代码列。")
             return
         if not col_year:
-            messagebox.showwarning("提示", "请在「数据选择」配置 年份/日期列。")
+            messagebox.showwarning("提示", "请在「数据选择」配置 日期/年份列。")
             return
 
         # v3.0: 将显示标签还原为真实列名
@@ -2928,6 +3080,7 @@ class WordFreqApp(tk.Tk):
             stopwords=stopwords,
             use_tf=self.var_tf.get(),
             export_sentences=self.var_sentences.get(),
+            preserve_rows=self.var_preserve_rows.get(),
             analyze_llm=self.var_llm.get(),
             llm_api_key=llm_api_key,
             llm_model=llm_model,

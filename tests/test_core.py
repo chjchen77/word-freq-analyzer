@@ -26,6 +26,12 @@ class CoreRegressionTests(unittest.TestCase):
             analyzer.parse_year_column(values).tolist(),
             [2024, 2024, 2011, 2009, 2024, 0],
         )
+        self.assertEqual(
+            analyzer.parse_month_column(pd.Series([
+                "2024", "2024-03-15", "2024年4月", "2011/1/1-2011/12/31", 45292,
+            ])).tolist(),
+            [0, 3, 4, 1, 1],
+        )
 
     def test_excel_headers_are_consistent_with_preview(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +72,8 @@ class CoreRegressionTests(unittest.TestCase):
                  "调研报告内容": "公司积极保护生态环境并修复湿地。"},
                 {"companyid": "2", "公司简称": "乙公司", "日期": "2024-03-15",
                  "调研报告内容": "公司持续推进绿色发展和环境治理。"},
+                {"companyid": "1", "公司简称": "甲公司", "日期": "2024-04-20",
+                 "调研报告内容": "公司继续推进绿色发展。"},
             ]).to_excel(source, index=False)
 
             manager = analyzer.DictionaryManager()
@@ -89,13 +97,21 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(sentence_output.exists())
             self.assertEqual(
                 pd.ExcelFile(output).sheet_names,
-                ["公司年份分类统计", "关键词明细", "分类汇总", "词典诊断", "分析说明"],
+                ["原始记录统计", "原始记录关键词", "分类汇总", "词典诊断", "分析说明"],
             )
-            panel = pd.read_excel(output, sheet_name="公司年份分类统计", dtype=str)
+            panel = pd.read_excel(output, sheet_name="原始记录统计", dtype=str)
             self.assertEqual(set(panel["公司代码"]), {"000001", "000002"})
+            self.assertEqual(len(panel), 3)
+            self.assertEqual((panel["公司代码"] == "000001").sum(), 2)
+            self.assertEqual(
+                int(panel.loc[panel["公司代码"] == "000002", "月份"].iloc[0]), 3
+            )
+            self.assertIn("日期", panel.columns)
+            self.assertIn("来源文件", panel.columns)
+            self.assertIn("源文件行号", panel.columns)
             self.assertTrue((pd.to_numeric(panel["总计"], errors="coerce") > 0).all())
             sentences = pd.read_excel(sentence_output, sheet_name="命中句子")
-            self.assertEqual(len(sentences), 2)
+            self.assertEqual(len(sentences), 3)
             self.assertFalse((tmp_path / "result_checkpoint").exists())
 
     def test_llm_partial_json_is_not_reported_as_success(self):

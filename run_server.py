@@ -116,7 +116,7 @@ def _parse_args() -> argparse.Namespace:
 
     # ── 列名配置 ────────────────────────────────────────────────────────────
     p.add_argument("--col-stkcd", default="公司代码", help="公司代码列名（默认：公司代码）")
-    p.add_argument("--col-year",  default="年份",     help="年份列名（默认：年份）")
+    p.add_argument("--col-year",  default="年份",     help="日期/年份列名（默认：年份）")
     p.add_argument(
         "--col-text",
         dest="col_texts",
@@ -146,6 +146,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="导出命中句子到独立 _sentences.xlsx（启用 LLM 时自动开启）",
+    )
+    p.add_argument(
+        "--aggregate-year",
+        action="store_true",
+        default=False,
+        help="兼容旧模式：按公司代码×年份汇总（默认逐条保留原始记录）",
     )
     p.add_argument(
         "--use-tf",
@@ -348,7 +354,7 @@ def main() -> int:
     log_cb(f"数据目录：{args.data_dirs}")
     log_cb(f"词典文件：{args.dict_files}")
     log_cb(f"输出路径：{args.output}")
-    log_cb(f"公司代码列：{args.col_stkcd} | 年份列：{args.col_year} | 文本列：{args.col_texts or ['文本内容']}")
+    log_cb(f"公司代码列：{args.col_stkcd} | 日期/年份列：{args.col_year} | 文本列：{args.col_texts or ['文本内容']}")
     log_cb(f"匹配模式：{'正则' if args.use_regex else 'jieba 分词'} | 文件处理进程：{args.workers}")
     if analyze_llm:
         limit_desc = "无上限" if args.llm_max_sentences <= 0 else str(args.llm_max_sentences)
@@ -448,6 +454,7 @@ def main() -> int:
             llm_cache_path=llm_cache_path,
             llm_system_prompt=llm_system_prompt,
             analysis_workers=args.workers,
+            preserve_rows=not args.aggregate_year,
             jieba_userdict=args.jieba_userdict,
             log_cb=log_cb,
             cancel_event=cancel_event,
