@@ -33,8 +33,9 @@
 
 - **Windows 便携版**：下载 `词频统计工具-v4.2.0-Windows-x64.zip`，解压后双击文件夹内的 exe
 - **Windows 安装版**：下载 `词频统计工具-Windows-x64-Setup.exe`，按向导安装
-- **macOS Intel**：下载带 `macOS-x86_64` 的 ZIP
 - **macOS Apple Silicon**：下载带 `macOS-arm64` 的 ZIP
+
+> 当前自动发布提供 Windows x64 和 macOS Apple Silicon 版本；macOS Intel 用户可按文档从源码构建。
 
 > macOS 首次打开可能提示「无法验证开发者」，右键点击 → 选择「打开」→ 点击「打开」即可。
 
