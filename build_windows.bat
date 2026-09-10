@@ -8,7 +8,7 @@ REM 打包后的 .exe 不需要安装 Python 即可运行。
 REM
 REM 前置条件：
 REM   1. 安装 Python 3.10 或更高版本
-REM   2. 本脚本会自动安装 requirements.txt 和 PyInstaller
+REM   2. 本脚本会自动安装锁定版本的依赖和 PyInstaller
 REM
 REM 用法：双击此文件 或 在命令行中运行 build_windows.bat
 REM ============================================================
@@ -22,13 +22,13 @@ python --version >nul 2>&1
 if errorlevel 1 (
     echo [错误] 未找到 Python，请先安装 Python 3.10+
     echo 下载地址: https://www.python.org/downloads/
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
 REM 检查并安装依赖
 echo 检查依赖...
-python -m pip install -q -r requirements.txt pyinstaller
+python -m pip install -q -r requirements-build.txt
 
 REM 清理旧构建
 if exist build rmdir /s /q build
@@ -42,6 +42,7 @@ python -m PyInstaller ^
     --onedir ^
     --windowed ^
     --name "词频统计分析工具" ^
+    --version-file "packaging\windows_version_info.txt" ^
     --hidden-import llm_sentence_analyzer ^
     --hidden-import jieba ^
     --hidden-import openpyxl ^
@@ -53,6 +54,7 @@ python -m PyInstaller ^
     --hidden-import jieba.analyse ^
     --collect-data jieba ^
     --collect-data openpyxl ^
+    --collect-submodules keyring.backends ^
     --exclude-module torch ^
     --exclude-module tensorflow ^
     --exclude-module matplotlib ^
@@ -64,7 +66,7 @@ python -m PyInstaller ^
 if errorlevel 1 (
     echo.
     echo [错误] 打包失败，请检查上方错误信息。
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -85,4 +87,4 @@ echo.
 echo 分发方式:
 echo   将 dist\词频统计分析工具\ 整个文件夹压缩为 .zip 发送给他人
 echo.
-pause
+if not defined CI pause

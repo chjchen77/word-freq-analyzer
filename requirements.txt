@@ -4,3 +4,6 @@ openpyxl>=3.0,<4
 xlrd>=2.0,<3
 openai>=1.0,<2
 xlsxwriter>=3.0,<4
+keyring>=25,<26
+# jieba 0.42.1 still imports pkg_resources; keep it available until jieba removes that dependency.
+setuptools<81

@@ -1,0 +1,128 @@
+name: Build and publish release packages
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to package, e.g. v4.2.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Build Windows portable package
+        shell: cmd
+        env:
+          CI: 'true'
+        run: build_windows.bat
+
+      - name: Add Windows instructions
+        shell: pwsh
+        run: Copy-Item -LiteralPath 'Windows使用说明.txt' -Destination 'dist/词频统计分析工具/Windows使用说明.txt'
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: Compress-Archive -LiteralPath 'dist/词频统计分析工具' -DestinationPath "词频统计工具-${{ env.RELEASE_TAG }}-Windows-x64.zip" -Force
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Create Windows installer
+        shell: powershell
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows-installer.iss'
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            词频统计工具-${{ env.RELEASE_TAG }}-Windows-x64.zip
+            dist/release/词频统计工具-Windows-x64-Setup.exe
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-14
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Build macOS application
+        run: ./build_app.sh
+
+      - name: Create macOS ZIP
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/词频统计分析工具.app" "词频统计工具-${{ env.RELEASE_TAG }}-macOS-${{ matrix.arch }}.zip"
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: 词频统计工具-${{ env.RELEASE_TAG }}-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: sha256sum release-files/* > release-files/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${{ env.RELEASE_TAG }}" \
+              --repo "${{ github.repository }}" \
+              --title "中文文本词频统计分析工具 ${{ env.RELEASE_TAG }}" \
+              --generate-notes
+          fi
+          gh release upload "${{ env.RELEASE_TAG }}" release-files/* \
+            --repo "${{ github.repository }}" --clobber

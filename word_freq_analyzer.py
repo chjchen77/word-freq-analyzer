@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-中文文本词频统计分析工具 v4.1
+中文文本词频统计分析工具 v4.2.0
 ==============================
 科研级中文文本词频统计。默认逐条保留原始记录，并从日期中识别年份和月份。
 支持分类词典管理、正则/jieba 双模式、命中句子导出。
@@ -27,10 +27,13 @@ import csv
 import hashlib
 import json
 import os
+import platform
 import re
+import subprocess
 import sys
 import threading
-from datetime import date, datetime
+import webbrowser
+from datetime import date, datetime, timezone
 # tkinter 仅 GUI 模式需要；服务器/CLI 模式下可无 tkinter 正常运行核心功能
 try:
     import tkinter as tk
@@ -94,6 +97,17 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
+from wordfreq_app import APP_NAME, APP_VERSION, GITHUB_REPOSITORY
+from wordfreq_app.excel_layout import describe_layout, detect_xls_layout, detect_xlsx_layout
+from wordfreq_app.quality import (
+    dictionary_sha256,
+    empty_quality_stats,
+    input_manifest_dataframe,
+    merge_quality_stats,
+    metadata_dataframe,
+    quality_report_dataframe,
+)
+from wordfreq_app.settings import load_api_key, load_settings, save_api_key, save_settings
 # jieba 延迟导入：仅在实际使用分词时加载，避免启动时耗时
 
 # ============================================================
@@ -102,6 +116,13 @@ import pandas as pd
 
 # v3.1: 加入 .txt 支持（年报纯文本，文件名格式：代码_年份_公司名_标题_日期.txt）
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".txt"}
+
+AGGREGATION_RAW = "raw"
+AGGREGATION_MONTHLY = "monthly"
+AGGREGATION_YEARLY = "yearly"
+AGGREGATION_MODES = {AGGREGATION_RAW, AGGREGATION_MONTHLY, AGGREGATION_YEARLY}
+QUALITY_ISSUE_LIMIT = 10_000
+QUALITY_ISSUE_LIMIT_PER_CHUNK = 250
 
 MAX_EXCEL_ROWS = 1_048_575  # Excel 行上限（减去表头）
 BIG_CSV_THRESHOLD = 100 * 1024 * 1024  # 100MB
@@ -210,22 +231,21 @@ def _frame_from_excel_rows(rows: list[tuple], columns: list[str]) -> pd.DataFram
 
 
 def read_excel_chunked(filepath: str, chunksize: int = EXCEL_CHUNK_ROWS):
-    """以 openpyxl read_only 模式分块读取 .xlsx 的第一张工作表。
-
-    pandas.read_excel 默认读取第一张工作表，因此这里也固定使用第一张，
-    避免“预览/分析因活动工作表不同而读到另一张表”的隐性不一致。
-    """
+    """Stream an .xlsx file after automatically locating its data sheet/header."""
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
         raise ValueError("读取 .xlsx 文件需要安装 openpyxl 库：pip install openpyxl") from exc
 
+    sheet_name, header_row, _confidence = detect_xlsx_layout(filepath)
     wb = load_workbook(filepath, read_only=True, data_only=True)
     try:
-        ws = wb.worksheets[0] if wb.worksheets else None
+        ws = wb[sheet_name] if sheet_name in wb.sheetnames else (
+            wb.worksheets[0] if wb.worksheets else None
+        )
         if ws is None:
             return
-        rows = ws.iter_rows(values_only=True)
+        rows = ws.iter_rows(min_row=header_row + 1, values_only=True)
         try:
             raw_header = next(rows)
         except StopIteration:
@@ -507,7 +527,11 @@ def read_data_file(filepath: str, nrows=None) -> pd.DataFrame:
         return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     if ext == ".xls":
         try:
-            return pd.read_excel(filepath, nrows=nrows, dtype=str)
+            sheet_name, header_row, _confidence = detect_xls_layout(filepath)
+            return pd.read_excel(
+                filepath, sheet_name=sheet_name, header=header_row,
+                nrows=nrows, dtype=str,
+            )
         except ImportError:
             if ext == ".xls":
                 raise ValueError(
@@ -571,9 +595,17 @@ def _read_columns_fast(filepath: str) -> list[str]:
         if ext == ".xlsx":
             try:
                 from openpyxl import load_workbook
+                sheet_name, header_row, _confidence = detect_xlsx_layout(filepath)
                 wb = load_workbook(filepath, read_only=True, data_only=True)
-                ws = wb.worksheets[0] if wb.worksheets else None
-                for row in ws.iter_rows(max_row=1, values_only=True):
+                ws = wb[sheet_name] if sheet_name in wb.sheetnames else (
+                    wb.worksheets[0] if wb.worksheets else None
+                )
+                if ws is None:
+                    wb.close()
+                    return []
+                for row in ws.iter_rows(
+                    min_row=header_row + 1, max_row=header_row + 1, values_only=True,
+                ):
                     cols = _normalize_column_names(row)
                     wb.close()
                     return cols
@@ -583,7 +615,14 @@ def _read_columns_fast(filepath: str) -> list[str]:
                 pass
         # 回退到 pandas（较慢但更兼容）
         try:
-            df = pd.read_excel(filepath, nrows=0, dtype=str)
+            if ext == ".xls":
+                sheet_name, header_row, _confidence = detect_xls_layout(filepath)
+                df = pd.read_excel(
+                    filepath, sheet_name=sheet_name, header=header_row,
+                    nrows=0, dtype=str,
+                )
+            else:
+                df = pd.read_excel(filepath, nrows=0, dtype=str)
             return [str(c) for c in df.columns]
         except Exception:
             return []
@@ -800,18 +839,30 @@ def _process_one_file(
     export_sentences: bool,
     word_to_cat: dict[str, str],
     agg_rules: dict[str, str],
-    preserve_rows: bool,
+    aggregation_mode: str,
+    retained_columns: list[str],
     cancel_event,
-) -> tuple[list, list, str]:
-    """处理单个文件，返回 (chunks, sents, log_msg)，异常会向上抛出。
+) -> tuple[list, list, str, dict, list[dict]]:
+    """处理单个文件并返回结果、句子、日志、质量统计和异常样本。
     设计为独立函数（非闭包），可安全地在 ThreadPoolExecutor 中并发调用。
     """
-    if cancel_event is not None and cancel_event.is_set():
-        return [], [], "已取消"
-
     fname = os.path.basename(fpath)
     rel_dir = os.path.basename(os.path.dirname(fpath))
     display_name = f"{rel_dir}/{fname}" if rel_dir else fname
+    quality = empty_quality_stats(display_name)
+    issues: list[dict] = []
+    try:
+        sheet_name, header_row, confidence = describe_layout(fpath)
+        if sheet_name:
+            quality["工作表"] = sheet_name
+            quality["表头行"] = header_row + 1
+            quality["表头识别置信度"] = f"{confidence * 100:.1f}%"
+    except Exception:
+        pass
+
+    if cancel_event is not None and cancel_event.is_set():
+        quality["状态"] = "已取消"
+        return [], [], "已取消", quality, issues
 
     ext = Path(fpath).suffix.lower()
     file_size = os.path.getsize(fpath)
@@ -819,82 +870,104 @@ def _process_one_file(
     if ext == ".xlsx":
         file_chunks: list = []
         file_sents: list = []
-        file_rows = file_hits = file_dropped = chunk_num = 0
+        file_rows = file_hits = chunk_num = 0
         source_row_offset = 0
         for chunk_df in read_excel_chunked(fpath, EXCEL_CHUNK_ROWS):
             if cancel_event is not None and cancel_event.is_set():
                 break
             chunk_num += 1
-            result, rows, hits, sents, dropped = _process_chunk(
+            result, sents, chunk_quality, chunk_issues = _process_chunk(
                 chunk_df, col_stkcd, col_year, text_columns,
                 keywords, use_regex, all_dict_words,
                 stopwords, use_stopwords, export_sentences, word_to_cat,
                 source_file=display_name,
                 source_row_offset=source_row_offset,
-                preserve_rows=preserve_rows,
+                aggregation_mode=aggregation_mode,
+                retained_columns=retained_columns,
             )
             source_row_offset += len(chunk_df)
+            merge_quality_stats(quality, chunk_quality)
+            issues.extend(chunk_issues[:max(0, QUALITY_ISSUE_LIMIT - len(issues))])
             if result is not None:
                 file_chunks.append(result)
-                file_rows += rows
-                file_hits += hits
+                file_rows += int(chunk_quality["原始行数"])
+                file_hits += int(chunk_quality["关键词命中次数"])
                 file_sents.extend(sents)
-                file_dropped += dropped
         if file_chunks:
-            if not preserve_rows:
+            quality["状态"] = "成功"
+            if aggregation_mode != AGGREGATION_RAW:
+                group_columns = ["公司代码", "年份"]
+                if aggregation_mode == AGGREGATION_MONTHLY:
+                    group_columns.append("月份")
                 merged = pd.concat(file_chunks, ignore_index=True)
-                merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+                merged = merged.groupby(group_columns, as_index=False).agg(agg_rules)
                 file_chunks = [merged]
-            dropped_note = f"（{file_dropped}行年份无效）" if file_dropped else ""
-            return file_chunks, file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
-        return [], [], f"{display_name}  跳过：无有效数据"
+            issue_count = int(quality["公司代码为空"]) + int(quality["年份无法识别"])
+            dropped_note = f"（{issue_count}行缺少代码或年份）" if issue_count else ""
+            return file_chunks, file_sents, f"{display_name}  {chunk_num}块 {quality['原始行数']}行 命中{file_hits}次{dropped_note}", quality, issues
+        quality["状态"] = "无有效数据"
+        return [], [], f"{display_name}  跳过：无有效数据", quality, issues
     elif ext == ".csv" and file_size > BIG_CSV_THRESHOLD:
         file_chunks: list = []
         file_sents: list = []
-        file_rows = file_hits = file_dropped = chunk_num = 0
+        file_rows = file_hits = chunk_num = 0
         source_row_offset = 0
         for chunk_df in read_csv_chunked(fpath, CHUNK_ROWS):
             if cancel_event is not None and cancel_event.is_set():
                 break
             chunk_num += 1
-            result, rows, hits, sents, dropped = _process_chunk(
+            result, sents, chunk_quality, chunk_issues = _process_chunk(
                 chunk_df, col_stkcd, col_year, text_columns,
                 keywords, use_regex, all_dict_words,
                 stopwords, use_stopwords, export_sentences, word_to_cat,
                 source_file=display_name,
                 source_row_offset=source_row_offset,
-                preserve_rows=preserve_rows,
+                aggregation_mode=aggregation_mode,
+                retained_columns=retained_columns,
             )
             source_row_offset += len(chunk_df)
+            merge_quality_stats(quality, chunk_quality)
+            issues.extend(chunk_issues[:max(0, QUALITY_ISSUE_LIMIT - len(issues))])
             if result is not None:
                 file_chunks.append(result)
-                file_rows += rows
-                file_hits += hits
+                file_rows += int(chunk_quality["原始行数"])
+                file_hits += int(chunk_quality["关键词命中次数"])
                 file_sents.extend(sents)
-                file_dropped += dropped
         if file_chunks:
-            if not preserve_rows:
+            quality["状态"] = "成功"
+            if aggregation_mode != AGGREGATION_RAW:
+                group_columns = ["公司代码", "年份"]
+                if aggregation_mode == AGGREGATION_MONTHLY:
+                    group_columns.append("月份")
                 merged = pd.concat(file_chunks, ignore_index=True)
-                merged = merged.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+                merged = merged.groupby(group_columns, as_index=False).agg(agg_rules)
                 file_chunks = [merged]
-            dropped_note = f"（{file_dropped}行年份无效）" if file_dropped else ""
-            return file_chunks, file_sents, f"{display_name}  {chunk_num}块 {file_rows}行 命中{file_hits}次{dropped_note}"
-        return [], [], f"{display_name}  跳过：无有效数据"
+            issue_count = int(quality["公司代码为空"]) + int(quality["年份无法识别"])
+            dropped_note = f"（{issue_count}行缺少代码或年份）" if issue_count else ""
+            return file_chunks, file_sents, f"{display_name}  {chunk_num}块 {quality['原始行数']}行 命中{file_hits}次{dropped_note}", quality, issues
+        quality["状态"] = "无有效数据"
+        return [], [], f"{display_name}  跳过：无有效数据", quality, issues
     else:
         df = read_data_file(fpath)
-        result, rows, hits, sents, dropped = _process_chunk(
+        result, sents, file_quality, file_issues = _process_chunk(
             df, col_stkcd, col_year, text_columns,
             keywords, use_regex, all_dict_words,
             stopwords, use_stopwords, export_sentences, word_to_cat,
             source_file=display_name,
             source_row_offset=0,
-            preserve_rows=preserve_rows,
+            aggregation_mode=aggregation_mode,
+            retained_columns=retained_columns,
         )
+        merge_quality_stats(quality, file_quality)
+        issues.extend(file_issues)
         del df
         if result is not None:
-            dropped_note = f"（{dropped}行年份无效）" if dropped else ""
-            return [result], sents, f"{display_name}  {rows}行 命中{hits}次{dropped_note}"
-        return [], [], f"{display_name}  跳过：缺少必需列或无有效数据"
+            quality["状态"] = "成功"
+            issue_count = int(quality["公司代码为空"]) + int(quality["年份无法识别"])
+            dropped_note = f"（{issue_count}行缺少代码或年份）" if issue_count else ""
+            return [result], sents, f"{display_name}  {quality['原始行数']}行 命中{quality['关键词命中次数']}次{dropped_note}", quality, issues
+        quality["状态"] = file_quality.get("状态", "缺少必需列或无有效数据")
+        return [], [], f"{display_name}  跳过：{quality['状态']}", quality, issues
 
 
 def load_stopwords_file(path: str) -> set[str]:
@@ -931,44 +1004,85 @@ def _process_chunk(
     *,
     source_file: str = "",
     source_row_offset: int = 0,
-    preserve_rows: bool = False,
-) -> tuple[pd.DataFrame | None, int, int, list[dict], int]:
+    aggregation_mode: str = AGGREGATION_RAW,
+    retained_columns: list[str] | None = None,
+) -> tuple[pd.DataFrame | None, list[dict], dict, list[dict]]:
     """
     处理单个 DataFrame（整文件或 CSV 块）。
-    返回 (结果 DataFrame, 原始行数, 命中次数, 命中句子列表, 年份无效行数)。
-    preserve_rows=True 时逐条保留原始记录；否则返回按公司×年份聚合的数据。
+    返回 (结果 DataFrame, 命中句子, 质量统计, 异常记录样本)。
     """
     hit_sents: list[dict] = []
+    issues: list[dict] = []
+    quality = empty_quality_stats(source_file)
+    quality["原始行数"] = len(df)
+
+    if aggregation_mode not in AGGREGATION_MODES:
+        raise ValueError(f"未知统计方式：{aggregation_mode}")
+
+    def add_issues(mask: pd.Series, reason: str) -> None:
+        remaining = QUALITY_ISSUE_LIMIT_PER_CHUNK - len(issues)
+        if remaining <= 0:
+            return
+        positions = [i for i, value in enumerate(mask.fillna(False).tolist()) if value][:remaining]
+        for position in positions:
+            row = df.iloc[position]
+            issues.append({
+                "来源文件": source_file,
+                "源文件行号": source_row_offset + position + 2,
+                "问题类型": reason,
+                "原公司代码": _format_date_value(row.get(col_stkcd, "")),
+                "原日期值": _format_date_value(row.get(col_year, "")),
+            })
 
     if col_stkcd not in df.columns:
-        return None, 0, 0, [], 0
+        quality["状态"] = f"缺少公司代码列：{col_stkcd}"
+        return None, [], quality, issues
     if col_year not in df.columns:
-        return None, 0, 0, [], 0
+        quality["状态"] = f"缺少日期列：{col_year}"
+        return None, [], quality, issues
 
     available_text = [c for c in text_columns if c in df.columns]
     if not available_text:
-        return None, 0, 0, [], 0
+        quality["状态"] = "缺少已选择的文本列"
+        return None, [], quality, issues
 
     df = df.copy()
-    raw_rows = len(df)  # v3.0: 在过滤前记录原始行数
     df["_source_file"] = source_file
     df["_source_row"] = range(source_row_offset + 2, source_row_offset + 2 + len(df))
     df["_stkcd"] = df[col_stkcd].apply(fix_stock_code)
-    # 过滤空/无效公司代码，防止空字符串聚合成一条虚假"公司"记录污染面板
     _empty_stkcd_mask = df["_stkcd"].fillna("").str.strip() == ""
-    if _empty_stkcd_mask.any():
-        df = df[~_empty_stkcd_mask].copy()
     df["_year"] = parse_year_column(df[col_year])
     df["_month"] = parse_month_column(df[col_year])
     df["_date"] = df[col_year].map(_format_date_value)
-    dropped_years = (df["_year"] == 0).sum()
-    # 注意：_process_chunk 可在子进程中运行，log 不在作用域；年份警告由调用方汇总
-    df = df[df["_year"] > 0].copy()  # v3.0: .copy() 防止 SettingWithCopyWarning
+    _invalid_year_mask = (~_empty_stkcd_mask) & (df["_year"] == 0)
+    _base_valid_mask = (~_empty_stkcd_mask) & (df["_year"] > 0)
+    _unknown_month_mask = _base_valid_mask & (df["_month"] == 0)
+
+    joined_text = df[available_text].fillna("").astype(str).agg("\n\n".join, axis=1)
+    _empty_text_mask = _base_valid_mask & (joined_text.str.strip() == "")
+    _mode_valid_mask = _base_valid_mask
+    if aggregation_mode == AGGREGATION_MONTHLY:
+        _mode_valid_mask = _base_valid_mask & (df["_month"] > 0)
+
+    quality["公司代码为空"] = int(_empty_stkcd_mask.sum())
+    quality["年份无法识别"] = int(_invalid_year_mask.sum())
+    quality["月份无法识别"] = int(_unknown_month_mask.sum())
+    quality["文本为空"] = int(_empty_text_mask.sum())
+    quality["有效记录数"] = int(_base_valid_mask.sum())
+    quality["进入统计记录数"] = int(_mode_valid_mask.sum())
+    add_issues(_empty_stkcd_mask, "公司代码为空")
+    add_issues(_invalid_year_mask, "年份无法识别")
+    add_issues(_unknown_month_mask, "月份无法识别")
+    add_issues(_empty_text_mask, "文本为空")
+
+    df = df[_mode_valid_mask].copy()
+    joined_text = joined_text.loc[df.index]
     if len(df) == 0:
-        return None, raw_rows, 0, [], int(dropped_years)
+        quality["状态"] = "无有效记录"
+        return None, [], quality, issues
     # 多列文本必须带分隔符拼接：直接 "".join 会让上一列结尾字与下一列开头字
     # 粘成不存在的词（如"生"+"态"→"生态"），既虚增词频也污染句子切分。
-    text_series = df[available_text].fillna("").astype(str).agg("\n\n".join, axis=1)
+    text_series = joined_text
 
     # 先切句，再在「切句结果」上计数，而非直接在原始文本上 str.count：
     #   · 原始文本被 PDF 折行切断的关键词（"生态\n环境"）无法匹配，实测漏计约 7%；
@@ -1014,6 +1128,7 @@ def _process_chunk(
             df[kw] = kw_df[kw].values
 
     n_hits = int(df[keywords].sum().sum())
+    quality["关键词命中次数"] = n_hits
 
     # 提取命中句子
     # 用 str.__contains__（C 级 Boyer-Moore 搜索）替代 re.search：
@@ -1047,22 +1162,42 @@ def _process_chunk(
                             "命中句子": sent,
                         })
 
-    if preserve_rows:
-        # 逐条输出时保留日期、月份和源文件行号，确保相同公司同一天的多条记录也不合并。
-        chunk = df[["_stkcd", "_year", "_month", "_date",
-                    "_source_file", "_source_row"] + keywords].copy()
-        chunk.columns = ["公司代码", "年份", "月份", "日期", "来源文件", "源文件行号"] + keywords
+    if aggregation_mode == AGGREGATION_RAW:
+        # 逐条输出时保留用户勾选的原字段，确保相同公司同一天的多条记录也不合并。
+        retained = [
+            column for column in (retained_columns or [])
+            if column in df.columns
+            and column not in {col_stkcd, col_year, *keywords}
+            and not column.startswith("_")
+        ]
+        internal_columns = [
+            "_stkcd", "_year", "_month", "_date", "_source_file", "_source_row",
+        ]
+        chunk = df[internal_columns + retained + keywords].copy()
+        chunk.rename(columns={
+            "_stkcd": "公司代码",
+            "_year": "年份",
+            "_month": "月份",
+            "_date": "日期",
+            "_source_file": "来源文件",
+            "_source_row": "源文件行号",
+        }, inplace=True)
         chunk["月份"] = chunk["月份"].replace(0, pd.NA).astype("Int64")
         chunk["源文件行号"] = pd.to_numeric(chunk["源文件行号"], errors="coerce").astype("Int64")
-        return chunk, raw_rows, n_hits, hit_sents, int(dropped_years)
+        return chunk, hit_sents, quality, issues
 
-    # 兼容旧的公司×年份汇总模式。
-    chunk = df[["_stkcd", "_year"] + keywords].copy()
-    chunk.columns = ["公司代码", "年份"] + keywords
+    if aggregation_mode == AGGREGATION_MONTHLY:
+        group_columns = ["公司代码", "年份", "月份"]
+        chunk = df[["_stkcd", "_year", "_month"] + keywords].copy()
+        chunk.columns = group_columns + keywords
+    else:
+        group_columns = ["公司代码", "年份"]
+        chunk = df[["_stkcd", "_year"] + keywords].copy()
+        chunk.columns = group_columns + keywords
     agg_rules = {kw: "sum" for kw in keywords}
-    chunk_agg = chunk.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
+    chunk_agg = chunk.groupby(group_columns, as_index=False).agg(agg_rules)
 
-    return chunk_agg, raw_rows, n_hits, hit_sents, int(dropped_years)
+    return chunk_agg, hit_sents, quality, issues
 
 
 def run_analysis(
@@ -1088,18 +1223,33 @@ def run_analysis(
     llm_cache_path: str | None = None,
     llm_system_prompt: str = "",
     analysis_workers: int = 1,
-    preserve_rows: bool = True,
+    preserve_rows: bool | None = None,
+    aggregation_mode: str | None = None,
+    retained_columns: list[str] | None = None,
     jieba_userdict: str = "",
     progress_cb=None,
     log_cb=None,
     cancel_event: threading.Event | None = None,
 ):
+    run_started_at = datetime.now(timezone.utc)
+
     def log(msg):
         if log_cb:
             log_cb(msg)
 
     def is_cancelled():
         return cancel_event is not None and cancel_event.is_set()
+
+    if aggregation_mode is None:
+        aggregation_mode = (
+            AGGREGATION_YEARLY if preserve_rows is False else AGGREGATION_RAW
+        )
+    if aggregation_mode not in AGGREGATION_MODES:
+        raise ValueError(
+            f"统计方式必须是 raw、monthly 或 yearly，当前为：{aggregation_mode}"
+        )
+    preserve_rows = aggregation_mode == AGGREGATION_RAW
+    retained_columns = list(dict.fromkeys(retained_columns or []))
 
     word_to_cat = dict_mgr.word_to_category()
     all_dict_words = dict_mgr.all_words()
@@ -1143,6 +1293,12 @@ def run_analysis(
     ]
     if len(files) != _input_files_before_filter:
         log(f"已排除输出目录中的 {_input_files_before_filter - len(files)} 个旧结果文件，避免重复分析。")
+    all_input_files = list(files)
+    log("正在生成输入文件清单和可复现指纹…")
+    input_manifest = input_manifest_dataframe(all_input_files)
+    dictionary_fingerprint = dictionary_sha256({
+        category: list(dict_mgr.words(category)) for category in dict_mgr.categories()
+    })
 
     # v3.0: 跨分类重复关键词警告（同一词在多个分类中只会归入最后一个分类）
     duplicates = dict_mgr.find_duplicates()
@@ -1205,8 +1361,12 @@ def run_analysis(
         log("匹配模式：jieba 分词")
 
     log(f"词典：{len(keywords)} 个关键词，{len(categories)} 个分类")
-    if preserve_rows:
+    if aggregation_mode == AGGREGATION_RAW:
         log("统计方式：逐条保留原始记录，不按年份或月份汇总；结果包含日期和月份列。")
+        if retained_columns:
+            log(f"保留原始字段：{', '.join(retained_columns)}")
+    elif aggregation_mode == AGGREGATION_MONTHLY:
+        log("统计方式：按公司代码×年份×月份汇总；无法识别月份的记录不会进入月度表。")
     else:
         log("统计方式：按公司代码×年份汇总。")
     log(f"公司代码列：{col_stkcd}，日期/年份列：{col_year}")
@@ -1214,6 +1374,8 @@ def run_analysis(
 
     all_chunks: list[pd.DataFrame] = []
     hit_sentences: list[dict] = []
+    quality_rows: list[dict] = []
+    quality_issues: list[dict] = []
     total_files = len(files)
     agg_rules = {kw: "sum" for kw in keywords}
     _sent_lock = threading.Lock()
@@ -1229,6 +1391,8 @@ def run_analysis(
     _ckpt_sents_path  = os.path.join(_ckpt_dir, "sentences.csv")
     _ckpt_done_path   = os.path.join(_ckpt_dir, "done_files.txt")
     _ckpt_meta_path   = os.path.join(_ckpt_dir, "metadata.json")
+    _ckpt_quality_path = os.path.join(_ckpt_dir, "quality.csv")
+    _ckpt_issues_path = os.path.join(_ckpt_dir, "quality_issues.csv")
 
     _checkpoint_files = []
     for _f in sorted(files):
@@ -1246,7 +1410,8 @@ def run_analysis(
         "col_stkcd": col_stkcd,
         "col_year": col_year,
         "text_columns": list(text_columns),
-        "preserve_rows": bool(preserve_rows),
+        "aggregation_mode": aggregation_mode,
+        "retained_columns": list(retained_columns),
         "dictionary": {cat: list(dict_mgr.words(cat)) for cat in categories},
         "keywords": list(keywords),
         "use_regex": bool(use_regex),
@@ -1285,9 +1450,9 @@ def run_analysis(
                     _ck_df = pd.read_csv(_ckpt_chunks_path, dtype={"公司代码": str, "年份": str})
                     for _kc in [c for c in keywords if c in _ck_df.columns]:
                         _ck_df[_kc] = pd.to_numeric(_ck_df[_kc], errors="coerce").fillna(0).astype(int)
-                    if preserve_rows and "月份" in _ck_df.columns:
+                    if aggregation_mode in {AGGREGATION_RAW, AGGREGATION_MONTHLY} and "月份" in _ck_df.columns:
                         _ck_df["月份"] = pd.to_numeric(_ck_df["月份"], errors="coerce").replace(0, pd.NA).astype("Int64")
-                    if preserve_rows and "源文件行号" in _ck_df.columns:
+                    if aggregation_mode == AGGREGATION_RAW and "源文件行号" in _ck_df.columns:
                         _ck_df["源文件行号"] = pd.to_numeric(_ck_df["源文件行号"], errors="coerce").astype("Int64")
                     all_chunks.append(_ck_df)
                     log(f"  已加载断点 chunks：{len(_ck_df)} 行")
@@ -1299,6 +1464,12 @@ def run_analysis(
                     del _sk_df
                     if sentence_cap > 0 and len(hit_sentences) >= sentence_cap:
                         hit_sentences[:] = hit_sentences[:sentence_cap]
+                if os.path.isfile(_ckpt_quality_path):
+                    _quality_df = pd.read_csv(_ckpt_quality_path).fillna("")
+                    quality_rows.extend(_quality_df.to_dict("records"))
+                if os.path.isfile(_ckpt_issues_path):
+                    _issues_df = pd.read_csv(_ckpt_issues_path).fillna("")
+                    quality_issues.extend(_issues_df.to_dict("records"))
                 files = [f for f in files if f not in _resume_done_set]
                 log(f"  剩余待处理：{len(files)} 个文件（原始共 {total_files} 个）")
             else:
@@ -1307,6 +1478,8 @@ def run_analysis(
         log(f"⚠️  断点加载失败，将从头开始：{_ckpt_load_err}")
         all_chunks.clear()
         hit_sentences.clear()
+        quality_rows.clear()
+        quality_issues.clear()
         _resume_done_set = set()
 
     # 元数据单独原子写入；即使程序随后中断，也不会产生“无指纹旧断点”。
@@ -1341,6 +1514,18 @@ def run_analysis(
                     _tmp_sents_path, index=False, encoding="utf-8-sig"
                 )
                 os.replace(_tmp_sents_path, _ckpt_sents_path)
+            if quality_rows:
+                _tmp_quality_path = _ckpt_quality_path + ".tmp"
+                pd.DataFrame(quality_rows).to_csv(
+                    _tmp_quality_path, index=False, encoding="utf-8-sig"
+                )
+                os.replace(_tmp_quality_path, _ckpt_quality_path)
+            if quality_issues:
+                _tmp_issues_path = _ckpt_issues_path + ".tmp"
+                pd.DataFrame(quality_issues[:QUALITY_ISSUE_LIMIT]).to_csv(
+                    _tmp_issues_path, index=False, encoding="utf-8-sig"
+                )
+                os.replace(_tmp_issues_path, _ckpt_issues_path)
             # 原子写 done_files（先写 .tmp 再 rename，防止写到一半崩溃）
             _tmp_done = _ckpt_done_path + ".tmp"
             with open(_tmp_done, "w", encoding="utf-8") as _f2:
@@ -1366,15 +1551,20 @@ def run_analysis(
             log(f"[{idx}/{total_files}] {display_name}")
             _file_succeeded = False
             try:
-                chunks, sents, msg = _process_one_file(
+                chunks, sents, msg, file_quality, file_issues = _process_one_file(
                     fpath, col_stkcd, col_year, text_columns,
                     keywords, use_regex, all_dict_words,
                     stopwords, use_stopwords, do_export_sentences,
-                    word_to_cat, agg_rules, preserve_rows, cancel_event,
+                    word_to_cat, agg_rules, aggregation_mode, retained_columns,
+                    cancel_event,
                 )
                 log(f"  {msg.split('  ', 1)[-1]}" if "  " in msg else f"  {msg}")
                 all_chunks.extend(chunks)
                 hit_sentences.extend(sents)
+                quality_rows.append(file_quality)
+                quality_issues.extend(
+                    file_issues[:max(0, QUALITY_ISSUE_LIMIT - len(quality_issues))]
+                )
                 if sentence_cap > 0 and len(hit_sentences) > sentence_cap:
                     hit_sentences[:] = hit_sentences[:sentence_cap]
                     do_export_sentences = False
@@ -1382,6 +1572,8 @@ def run_analysis(
                 _file_succeeded = True
             except Exception as e:
                 log(f"  跳过（错误）：{e}")
+                failed_quality = empty_quality_stats(display_name, f"处理失败：{e}")
+                quality_rows.append(failed_quality)
             # 只有成功完成的文件才加入断点；错误文件必须允许下次重试。
             if _file_succeeded:
                 _ckpt_done_list.append(fpath)
@@ -1417,7 +1609,8 @@ def run_analysis(
                     fpath, col_stkcd, col_year, text_columns,
                     keywords, use_regex, _worker_dict_words,
                     stopwords, use_stopwords, export_sentences,
-                    word_to_cat, agg_rules, preserve_rows, None,  # 子进程不传 cancel_event
+                    word_to_cat, agg_rules, aggregation_mode, retained_columns,
+                    None,  # 子进程不传 cancel_event
                 ): (i + 1, fpath)
                 for i, fpath in enumerate(files)
             }
@@ -1428,9 +1621,13 @@ def run_analysis(
                 _disp = completed + _already_done  # 显示时加上已跳过的断点文件数
                 _file_succeeded = False
                 try:
-                    chunks, sents, msg = future.result()
+                    chunks, sents, msg, file_quality, file_issues = future.result()
                     log(f"[{_disp}/{total_files}] {msg}")
                     all_chunks.extend(chunks)
+                    quality_rows.append(file_quality)
+                    quality_issues.extend(
+                        file_issues[:max(0, QUALITY_ISSUE_LIMIT - len(quality_issues))]
+                    )
                     if sents and not _sent_capped.is_set():
                         with _sent_lock:
                             if not _sent_capped.is_set():
@@ -1442,6 +1639,10 @@ def run_analysis(
                     _file_succeeded = True
                 except Exception as e:
                     log(f"[{_disp}/{total_files}] 跳过（错误）：{e}")
+                    failed_quality = empty_quality_stats(
+                        os.path.basename(fpath), f"处理失败：{e}"
+                    )
+                    quality_rows.append(failed_quality)
                 # 只有成功完成的 future 才能续跑跳过；异常文件下次重试。
                 if _file_succeeded:
                     _ckpt_done_list.append(fpath)
@@ -1478,16 +1679,33 @@ def run_analysis(
     del all_chunks
     gc.collect()
 
-    if preserve_rows:
-        # 新模式：不做任何公司/日期聚合，保留每一条有效原始记录。
+    if aggregation_mode == AGGREGATION_RAW:
         panel = combined
-        id_cols = ["公司代码", "年份", "月份", "日期", "来源文件", "源文件行号"]
+        del combined
+        retained_output_columns = [
+            column for column in retained_columns
+            if column in panel.columns
+            and column not in {"公司代码", "年份", "月份", "日期", "来源文件", "源文件行号"}
+        ]
+        id_cols = [
+            "公司代码", "年份", "月份", "日期", "来源文件", "源文件行号",
+            *retained_output_columns,
+        ]
         main_sheet_name = "原始记录统计"
         keyword_sheet_name = "原始记录关键词"
-        sort_cols = [c for c in id_cols if c in panel.columns]
+        sort_cols = ["公司代码", "年份", "月份", "日期", "来源文件", "源文件行号"]
         log(f"已保留 {len(panel):,} 条原始记录，未按年份或月份合并。")
+    elif aggregation_mode == AGGREGATION_MONTHLY:
+        group_columns = ["公司代码", "年份", "月份"]
+        panel = combined.groupby(group_columns, as_index=False).agg(agg_rules)
+        del combined
+        gc.collect()
+        id_cols = group_columns
+        main_sheet_name = "公司月份分类统计"
+        keyword_sheet_name = "公司月份关键词"
+        sort_cols = group_columns
+        log(f"已生成 {len(panel):,} 条公司×月份记录。")
     else:
-        # 兼容旧模式：按公司×年份聚合。
         panel = combined.groupby(["公司代码", "年份"], as_index=False).agg(agg_rules)
         del combined
         gc.collect()
@@ -1504,7 +1722,7 @@ def run_analysis(
     for cat in categories:
         cat_to_kws[cat] = [kw for kw in keywords if word_to_cat.get(kw) == cat]
 
-    # ---- Sheet1: 原始记录/公司×年份 分类统计 ----
+    # ---- Sheet1: 原始记录/公司×月份/公司×年份 分类统计 ----
     sheet1 = panel[id_cols].copy()
     for cat in categories:
         cat_kws = [kw for kw in cat_to_kws.get(cat, []) if kw in panel.columns]
@@ -1580,9 +1798,63 @@ def run_analysis(
 
     # ---- 先写词频结果 Excel（LLM 开始前落盘，防止 OOM 崩溃导致数据全丢）----
     log("正在写入词频结果 Excel…")
+    quality_df = quality_report_dataframe(quality_rows)
+    issues_df = pd.DataFrame(
+        quality_issues[:QUALITY_ISSUE_LIMIT],
+        columns=["来源文件", "源文件行号", "问题类型", "原公司代码", "原日期值"],
+    )
+    mode_labels = {
+        AGGREGATION_RAW: "逐条原始记录（不汇总）",
+        AGGREGATION_MONTHLY: "公司×月份汇总",
+        AGGREGATION_YEARLY: "公司×年份汇总",
+    }
+    run_metadata = metadata_dataframe({
+        "软件名称": APP_NAME,
+        "软件版本": APP_VERSION,
+        "运行开始时间(UTC)": run_started_at.isoformat(timespec="seconds"),
+        "主结果写出时间(UTC)": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "操作系统": platform.platform(),
+        "Python版本": platform.python_version(),
+        "统计方式": mode_labels[aggregation_mode],
+        "匹配方式": "直接关键词匹配（不区分大小写）" if use_regex else "jieba分词匹配",
+        "输入文件数": len(all_input_files),
+        "输出主表行数": len(sheet1),
+        "公司代码列": col_stkcd,
+        "日期列": col_year,
+        "文本列": "、".join(text_columns),
+        "保留原始字段": "、".join(retained_columns) if retained_columns else "无",
+        "词典分类数": len(categories),
+        "词典关键词数": len(keywords),
+        "词典SHA256": dictionary_fingerprint,
+        "停用词": "启用" if use_stopwords else "未启用",
+        "命中句子导出": "启用" if export_sentences else "未启用",
+        "LLM分析": f"启用（{llm_model}）" if analyze_llm else "未启用",
+        "异常记录表说明": (
+            f"最多保存前{QUALITY_ISSUE_LIMIT}条；当前保存{len(issues_df)}条"
+        ),
+    })
+    if not quality_df.empty:
+        total_quality = quality_df.iloc[-1]
+        log(
+            f"数据质量：原始 {int(total_quality['原始行数']):,} 行，"
+            f"有效 {int(total_quality['有效记录数']):,} 行，"
+            f"月份识别率 {total_quality['月份识别率(%)']}%"
+        )
+
+    mode_explanation = {
+        AGGREGATION_RAW: (
+            "当前逐条保留每一条有效原始记录，不按公司、年份或月份合并；"
+            "每条记录均保留日期、月份、来源文件、源文件行号及用户选择的原始字段。"
+        ),
+        AGGREGATION_MONTHLY: (
+            "当前按公司代码×年份×月份汇总；无法识别月份的记录列入数据质量报告，"
+            "但不进入月度结果。"
+        ),
+        AGGREGATION_YEARLY: "当前按公司代码×年份汇总；同一公司同一年内的多条记录会合并。",
+    }
     _explain_rows = [
-        {"项目": "统计方式", "说明": "当前默认逐条保留每一条有效原始记录，不按公司、年份或月份合并；每条记录均保留日期、月份、来源文件和源文件行号。" if preserve_rows else "当前按公司代码×年份汇总；同一公司同一年内的多条记录会合并。"},
-        {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该条原始记录文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。" if preserve_rows else "各分类列的数值为关键词在该公司-年份文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
+        {"项目": "统计方式", "说明": mode_explanation[aggregation_mode]},
+        {"项目": "Sheet1 计数含义", "说明": "各分类列的数值为关键词在该条记录或汇总单元文本中的【出现次数】（含重复），不等于命中句子数。若同一句话中关键词出现3次，计3次。"},
         {"项目": "独立命中句子文件", "说明": "每条记录为一个关键词在一个句子中的命中实例。若同一句子命中同一关键词N次，主表计N次，但句子文件仅记录该句子一次。"},
         {"项目": "分类占比列（_占比）", "说明": "= 该分类出现次数 / 该行所有分类出现次数之和。这是分类构成比，不是传统TF词频（词频/文档总词数）。"},
         {"项目": "LLM分析维度", "说明": "LLM时间指向/语态/句子类型/确定性/量化属性/语气均基于关键词所在句子的语义判断，temperature=0确保可复现。"},
@@ -1595,6 +1867,10 @@ def run_analysis(
         (main_sheet_name, sheet1),
         (keyword_sheet_name, sheet2),
         ("分类汇总", sheet3),
+        ("数据质量", quality_df),
+        ("异常记录", issues_df),
+        ("输入文件清单", input_manifest),
+        ("运行元数据", run_metadata),
         ("词典诊断", sheet_dict_diag),
         ("分析说明", pd.DataFrame(_explain_rows)),
     ])
@@ -1616,7 +1892,7 @@ def run_analysis(
     _year_max = int(sheet1["年份"].max()) if _n_sheet1 > 0 else 0
     _n_sheet2 = len(sheet2)
     _n_sheet3 = len(sheet3)
-    del sheet1, sheet2, sheet3, sheet_dict_diag
+    del sheet1, sheet2, sheet3, sheet_dict_diag, quality_df, issues_df, input_manifest, run_metadata
     gc.collect()
 
     # 第二步：写命中句子（不含 LLM 列）到独立文件，LLM 完成后覆盖写入
@@ -1724,7 +2000,11 @@ def run_analysis(
         del _sent_out
         gc.collect()
 
-    _result_label = "原始记录" if preserve_rows else "面板记录"
+    _result_label = {
+        AGGREGATION_RAW: "原始记录",
+        AGGREGATION_MONTHLY: "公司月份记录",
+        AGGREGATION_YEARLY: "公司年份记录",
+    }[aggregation_mode]
     log(f"完成！{_n_sheet1} 条{_result_label}，{_n_companies} 家公司，年份 {_year_min}-{_year_max}")
     log(f"Sheet1: {main_sheet_name} ({_n_sheet1} 行)")
     log(f"Sheet2: {keyword_sheet_name} ({_n_sheet2} 行)")
@@ -1917,7 +2197,8 @@ class WordFreqApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("中文文本词频统计分析工具 v4.1 — 陈浩杰 | 澳门城市大学金融学院")
+        self._saved_settings = load_settings()
+        self.title(f"{APP_NAME} v{APP_VERSION} — 陈浩杰 | 澳门城市大学金融学院")
         self.geometry("1020x800")
         self.resizable(True, True)
         self.minsize(880, 680)
@@ -1926,39 +2207,57 @@ class WordFreqApp(tk.Tk):
         self._setup_style()
 
         self.dict_mgr = DictionaryManager()
-        self.folders: list[str] = []
+        self.folders: list[str] = [
+            path for path in self._saved_settings.get("folders", [])
+            if isinstance(path, str) and os.path.isdir(path)
+        ]
         self.scanned_files: list[str] = []
         self.all_columns: list[str] = []
         self._col_freq: dict[str, int] = {}
         self._col_display_map: dict[str, str] = {}
 
-        self.output_path = tk.StringVar()
-        self.var_regex = tk.BooleanVar(value=True)
-        self.var_stopwords = tk.BooleanVar(value=False)
-        self.stopwords_path = tk.StringVar()
-        self.var_tf = tk.BooleanVar(value=False)
-        self.var_sentences = tk.BooleanVar(value=False)
-        self.var_preserve_rows = tk.BooleanVar(value=True)
-        self.analysis_workers_var = tk.StringVar(value="1")
-        self.var_llm = tk.BooleanVar(value=False)
-        self.llm_api_key_var = tk.StringVar(value=os.getenv("DASHSCOPE_API_KEY", ""))
-        self.llm_show_key_var = tk.BooleanVar(value=False)
-        self.llm_model_var = tk.StringVar(value=os.getenv("QWEN_MODEL", "qwen-plus"))
-        self.llm_base_url_var = tk.StringVar(
-            value=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        self.output_path = tk.StringVar(value=str(self._saved_settings.get("output_path", "")))
+        self.var_regex = tk.BooleanVar(value=bool(self._saved_settings.get("use_regex", True)))
+        self.var_stopwords = tk.BooleanVar(value=bool(self._saved_settings.get("use_stopwords", False)))
+        self.stopwords_path = tk.StringVar(value=str(self._saved_settings.get("stopwords_path", "")))
+        self.var_tf = tk.BooleanVar(value=bool(self._saved_settings.get("use_tf", False)))
+        self.var_sentences = tk.BooleanVar(value=bool(self._saved_settings.get("export_sentences", False)))
+        saved_mode = str(self._saved_settings.get("aggregation_mode", AGGREGATION_RAW))
+        if saved_mode not in AGGREGATION_MODES:
+            saved_mode = AGGREGATION_RAW
+        self.aggregation_mode_var = tk.StringVar(value=saved_mode)
+        self.analysis_workers_var = tk.StringVar(value=str(self._saved_settings.get("analysis_workers", "1")))
+        self.var_llm = tk.BooleanVar(value=bool(self._saved_settings.get("analyze_llm", False)))
+        remember_api_key = bool(self._saved_settings.get("remember_api_key", False))
+        saved_api_key = load_api_key() if remember_api_key else ""
+        self.llm_api_key_var = tk.StringVar(
+            value=os.getenv("DASHSCOPE_API_KEY", "") or saved_api_key
         )
-        self.llm_max_sentences_var = tk.StringVar(value="500")
-        self.var_llm_no_limit = tk.BooleanVar(value=False)
+        self.remember_api_key_var = tk.BooleanVar(value=remember_api_key)
+        self.llm_show_key_var = tk.BooleanVar(value=False)
+        self.llm_model_var = tk.StringVar(value=os.getenv(
+            "QWEN_MODEL", str(self._saved_settings.get("llm_model", "qwen-plus"))
+        ))
+        self.llm_base_url_var = tk.StringVar(
+            value=os.getenv(
+                "QWEN_BASE_URL",
+                str(self._saved_settings.get(
+                    "llm_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                )),
+            )
+        )
+        self.llm_max_sentences_var = tk.StringVar(value=str(self._saved_settings.get("llm_max_sentences", "500")))
+        self.var_llm_no_limit = tk.BooleanVar(value=bool(self._saved_settings.get("llm_no_limit", False)))
         self._llm_sent_entry = None  # 句子上限 Entry 引用，用于启用/禁用
-        self.llm_max_workers_var = tk.StringVar(value="4")
-        self.llm_max_retries_var = tk.StringVar(value="2")
-        self.llm_cache_custom_var = tk.BooleanVar(value=False)
-        self.llm_cache_path_var = tk.StringVar(value="")
+        self.llm_max_workers_var = tk.StringVar(value=str(self._saved_settings.get("llm_max_workers", "4")))
+        self.llm_max_retries_var = tk.StringVar(value=str(self._saved_settings.get("llm_max_retries", "2")))
+        self.llm_cache_custom_var = tk.BooleanVar(value=bool(self._saved_settings.get("llm_cache_custom", False)))
+        self.llm_cache_path_var = tk.StringVar(value=str(self._saved_settings.get("llm_cache_path", "")))
         self._llm_api_key_entry = None
         self._llm_cache_entry = None
         self._llm_cache_btn = None
         self._llm_prompt_text = None   # tk.Text 控件，保存自定义系统提示词
-        self.jieba_dict_path = tk.StringVar()
+        self.jieba_dict_path = tk.StringVar(value=str(self._saved_settings.get("jieba_dict_path", "")))
         self._word_search_var = tk.StringVar()
         self._word_search_var.trace_add("write", self._on_word_search)
         self.current_file_var = tk.StringVar(value="就绪")
@@ -1967,6 +2266,93 @@ class WordFreqApp(tk.Tk):
         self._cancel_event = threading.Event()
 
         self._build_ui()
+        self._restore_persisted_state()
+        self._on_llm_no_limit_toggle()
+        self._on_llm_cache_toggle()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _restore_persisted_state(self):
+        for folder in self.folders:
+            self.folder_listbox.insert(tk.END, folder)
+        dictionary_path = str(self._saved_settings.get("dictionary_path", ""))
+        self._last_dictionary_path = dictionary_path
+        if dictionary_path and os.path.isfile(dictionary_path):
+            try:
+                self.dict_mgr.import_file(dictionary_path)
+                self._refresh_cat_list()
+            except Exception:
+                self._last_dictionary_path = ""
+        recent = self._saved_settings.get("recent_outputs", [])
+        self._recent_outputs = [
+            path for path in recent if isinstance(path, str)
+        ][:10]
+        self._last_result_path = self._recent_outputs[0] if self._recent_outputs else ""
+
+    def _selected_columns_from(self, listbox) -> list[str]:
+        column_map = getattr(self, "_col_display_map", {})
+        result: list[str] = []
+        for index in listbox.curselection():
+            label = listbox.get(index)
+            result.append(column_map.get(label, label))
+        return result
+
+    def _collect_preferences(self) -> dict:
+        text_columns = (
+            self._selected_columns_from(self.col_listbox)
+            if self.all_columns else self._saved_settings.get("text_columns", [])
+        )
+        retained_columns = (
+            self._selected_columns_from(self.retain_listbox)
+            if self.all_columns else self._saved_settings.get("retained_columns", [])
+        )
+        return {
+            "folders": list(self.folders),
+            "output_path": self.output_path.get(),
+            "dictionary_path": getattr(self, "_last_dictionary_path", ""),
+            "company_column": self.combo_stkcd.get(),
+            "date_column": self.combo_year.get(),
+            "text_columns": text_columns,
+            "retained_columns": retained_columns,
+            "aggregation_mode": self.aggregation_mode_var.get(),
+            "use_regex": bool(self.var_regex.get()),
+            "use_stopwords": bool(self.var_stopwords.get()),
+            "stopwords_path": self.stopwords_path.get(),
+            "use_tf": bool(self.var_tf.get()),
+            "export_sentences": bool(self.var_sentences.get()),
+            "analysis_workers": self.analysis_workers_var.get(),
+            "analyze_llm": bool(self.var_llm.get()),
+            "remember_api_key": bool(self.remember_api_key_var.get()),
+            "llm_model": self.llm_model_var.get(),
+            "llm_base_url": self.llm_base_url_var.get(),
+            "llm_max_sentences": self.llm_max_sentences_var.get(),
+            "llm_no_limit": bool(self.var_llm_no_limit.get()),
+            "llm_max_workers": self.llm_max_workers_var.get(),
+            "llm_max_retries": self.llm_max_retries_var.get(),
+            "llm_cache_custom": bool(self.llm_cache_custom_var.get()),
+            "llm_cache_path": self.llm_cache_path_var.get(),
+            "jieba_dict_path": self.jieba_dict_path.get(),
+            "recent_outputs": list(getattr(self, "_recent_outputs", []))[:10],
+        }
+
+    def _persist_preferences(self, *, report_error: bool = False) -> bool:
+        try:
+            preferences = self._collect_preferences()
+            save_settings(preferences)
+            self._saved_settings = preferences
+            if self.remember_api_key_var.get():
+                if not save_api_key(self.llm_api_key_var.get().strip()):
+                    raise RuntimeError("系统凭据服务不可用，API Key 未保存")
+            else:
+                save_api_key("")
+            return True
+        except Exception as exc:
+            if report_error:
+                messagebox.showwarning("设置未保存", str(exc))
+            return False
+
+    def _on_close(self):
+        self._persist_preferences(report_error=False)
+        self.destroy()
 
     # ================================================================
     #  样式配置
@@ -2009,7 +2395,7 @@ class WordFreqApp(tk.Tk):
         self._status_var = tk.StringVar(value="就绪  |  词典：0 词  |  数据：0 文件")
         ttk.Label(status_frame, textvariable=self._status_var,
                   font=("", 10)).pack(side="left", padx=8, pady=3)
-        ttk.Label(status_frame, text="作者：陈浩杰 | 澳门城市大学金融学院",
+        ttk.Label(status_frame, text=f"v{APP_VERSION} | 作者：陈浩杰 | 澳门城市大学金融学院",
                   font=("", 9), foreground="#666666").pack(side="right", padx=8, pady=3)
 
     # ---- 标签页1：数据选择 ----
@@ -2078,8 +2464,27 @@ class WordFreqApp(tk.Tk):
         self.col_listbox.grid(row=2, column=1, sticky="nsew", pady=(4, 0))
         col_sb.grid(row=2, column=2, sticky="ns", pady=(4, 0))
 
+        ttk.Label(inner, text="保留字段（多选）：").grid(row=3, column=0, sticky="nw", pady=(4, 0))
+        self.retain_listbox = tk.Listbox(inner, height=3, selectmode="extended")
+        retain_sb = ttk.Scrollbar(inner, orient="vertical", command=self.retain_listbox.yview)
+        self.retain_listbox.configure(yscrollcommand=retain_sb.set)
+        self.retain_listbox.grid(row=3, column=1, sticky="nsew", pady=(4, 0))
+        retain_sb.grid(row=3, column=2, sticky="ns", pady=(4, 0))
+
+        self.data_quality_hint_var = tk.StringVar(value="扫描后可检查列映射与年月识别率")
+        quality_row = ttk.Frame(inner)
+        quality_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        ttk.Button(
+            quality_row, text="检查识别质量", command=self._preview_input_quality,
+        ).pack(side="left")
+        ttk.Label(
+            quality_row, textvariable=self.data_quality_hint_var,
+            foreground="#666666", wraplength=260,
+        ).pack(side="left", padx=(6, 0))
+
         inner.columnconfigure(1, weight=1)
         inner.rowconfigure(2, weight=1)
+        inner.rowconfigure(3, weight=1)
 
         # -- 数据预览 --
         frm_preview = ttk.LabelFrame(tab, text="数据预览（前 100 行，点击上方文件自动加载）")
@@ -2227,13 +2632,22 @@ class WordFreqApp(tk.Tk):
 
         row_out0 = ttk.Frame(frm_out_opts)
         row_out0.pack(fill="x", padx=8, pady=(4, 2))
-        ttk.Checkbutton(
-            row_out0, variable=self.var_preserve_rows,
-            text="逐条保留原始记录（推荐，不按年份或月份汇总；输出包含日期、月份、来源文件和行号）"
+        ttk.Label(row_out0, text="统计粒度：").pack(side="left")
+        ttk.Radiobutton(
+            row_out0, variable=self.aggregation_mode_var, value=AGGREGATION_RAW,
+            text="逐条原始记录（推荐，不汇总）",
+        ).pack(side="left", padx=(4, 12))
+        ttk.Radiobutton(
+            row_out0, variable=self.aggregation_mode_var, value=AGGREGATION_MONTHLY,
+            text="公司×月份",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            row_out0, variable=self.aggregation_mode_var, value=AGGREGATION_YEARLY,
+            text="公司×年份",
         ).pack(side="left")
         ttk.Label(
             frm_out_opts,
-            text="取消勾选后恢复旧模式：按公司代码×年份汇总。",
+            text="“识别月份”不等于“按月合并”：选择逐条模式时月份仅作为结果字段，每条原始记录仍独立保留。",
             foreground="#666666",
         ).pack(anchor="w", padx=28, pady=(0, 2))
 
@@ -2313,6 +2727,10 @@ class WordFreqApp(tk.Tk):
             key_row, text="显示",
             variable=self.llm_show_key_var,
             command=self._toggle_api_key_visibility,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(
+            key_row, text="安全记住",
+            variable=self.remember_api_key_var,
         ).pack(side="left", padx=(6, 0))
 
         # Row 1: Base URL
@@ -2434,6 +2852,13 @@ class WordFreqApp(tk.Tk):
         self.btn_start.pack(side="left", padx=5)
         self.btn_cancel = ttk.Button(btn_row, text="  取消  ", command=self._cancel_analysis, state="disabled")
         self.btn_cancel.pack(side="left", padx=5)
+        self.btn_open_result = ttk.Button(
+            btn_row, text="打开结果位置", command=self._open_result_location,
+        )
+        self.btn_open_result.pack(side="left", padx=5)
+        ttk.Button(btn_row, text="关于 / 检查更新", command=self._show_about).pack(
+            side="left", padx=5
+        )
 
         frm_prog = ttk.LabelFrame(tab, text="进度")
         frm_prog.pack(fill="x", **pad)
@@ -2515,12 +2940,14 @@ class WordFreqApp(tk.Tk):
         self.combo_stkcd["values"] = col_values
         self.combo_year["values"] = col_values
         self.col_listbox.delete(0, tk.END)
+        self.retain_listbox.delete(0, tk.END)
         self._col_display_map = {}
         for c in col_values:
             f = self._col_freq.get(c, 0)
             # 在列表中显示列名及其出现频率，方便用户判断
             label = f"{c}  [{f}/{n_files}]" if f < n_files else c
             self.col_listbox.insert(tk.END, label)
+            self.retain_listbox.insert(tk.END, label)
             self._col_display_map[label] = c
 
         # v3.0: 按频率加权的自动列匹配
@@ -2541,11 +2968,13 @@ class WordFreqApp(tk.Tk):
                 return candidates[0][0]
             return None
 
-        best_stkcd = _best_match(stkcd_patterns)
+        saved_company = str(self._saved_settings.get("company_column", ""))
+        saved_date = str(self._saved_settings.get("date_column", ""))
+        best_stkcd = saved_company if saved_company in col_values else _best_match(stkcd_patterns)
         if best_stkcd:
             self.combo_stkcd.set(best_stkcd)
 
-        best_year = _best_match(year_patterns)
+        best_year = saved_date if saved_date in col_values else _best_match(year_patterns)
         if best_year:
             self.combo_year.set(best_year)
 
@@ -2554,14 +2983,36 @@ class WordFreqApp(tk.Tk):
                          "问题", "question", "answer", "描述", "说明", "摘要", "正文",
                          "subject", "title", "标题", "body")
         auto_text_indices = []
-        for idx, label in enumerate(list(self._col_display_map.keys())):
+        labels = list(self._col_display_map.keys())
+        saved_text_columns = set(self._saved_settings.get("text_columns", []))
+        for idx, label in enumerate(labels):
             real_col = self._col_display_map[label]
             cl = real_col.lower()
-            if any(k in cl for k in text_patterns):
+            if (
+                (saved_text_columns and real_col in saved_text_columns)
+                or (not saved_text_columns and any(k in cl for k in text_patterns))
+            ):
                 auto_text_indices.append(idx)
         if auto_text_indices:
             for i in auto_text_indices:
                 self.col_listbox.selection_set(i)
+
+        retained_patterns = (
+            "公司简称", "公司名称", "企业名称", "companyname", "company_name",
+            "证券简称", "股票简称", "调研机构", "机构名称", "行业",
+        )
+        saved_retained_columns = set(self._saved_settings.get("retained_columns", []))
+        auto_retained_indices = []
+        for idx, label in enumerate(labels):
+            real_col = self._col_display_map[label]
+            lower = real_col.lower()
+            if (
+                (saved_retained_columns and real_col in saved_retained_columns)
+                or (not saved_retained_columns and any(pattern in lower for pattern in retained_patterns))
+            ):
+                auto_retained_indices.append(idx)
+        for index in auto_retained_indices:
+            self.retain_listbox.selection_set(index)
 
         # v3.0: 自动建议输出路径
         if not self.output_path.get() and self.folders:
@@ -2594,6 +3045,9 @@ class WordFreqApp(tk.Tk):
             auto_text_names = [self._col_display_map[list(self._col_display_map.keys())[i]]
                                for i in auto_text_indices]
             auto_info += f"\n  文本列 → {', '.join(auto_text_names)}"
+        if auto_retained_indices:
+            retained_names = [self._col_display_map[labels[i]] for i in auto_retained_indices]
+            auto_info += f"\n  保留字段 → {', '.join(retained_names)}"
         if auto_info:
             auto_info = f"\n\n自动检测的列配置：{auto_info}\n（请核实是否正确）"
 
@@ -2603,6 +3057,79 @@ class WordFreqApp(tk.Tk):
             f"分布在 {len(dir_counts)} 个目录中：\n{dir_info}\n\n"
             f"发现 {len(self.all_columns)} 个数据列。{auto_info}{err_info}"
         )
+        self.data_quality_hint_var.set("列已识别；建议点击“检查识别质量”后再运行")
+        self._persist_preferences(report_error=False)
+
+    def _preview_input_quality(self):
+        if not self.scanned_files:
+            messagebox.showwarning("提示", "请先扫描文件。")
+            return
+        company_column = self.combo_stkcd.get()
+        date_column = self.combo_year.get()
+        text_columns = self._selected_columns_from(self.col_listbox)
+        if not company_column or not date_column or not text_columns:
+            messagebox.showwarning("提示", "请先选择公司代码列、日期列和至少一个文本列。")
+            return
+
+        sampled_files = list(self.scanned_files[:100])
+        self.data_quality_hint_var.set(f"正在抽查 {len(sampled_files)} 个文件…")
+
+        def work():
+            total_rows = valid_rows = month_rows = empty_text = 0
+            failed: list[str] = []
+            layout_lines: list[str] = []
+            for path in sampled_files:
+                try:
+                    frame = read_data_file(path, nrows=500)
+                    missing = [
+                        column for column in [company_column, date_column, *text_columns]
+                        if column not in frame.columns
+                    ]
+                    if missing:
+                        failed.append(f"{os.path.basename(path)}：缺少 {', '.join(missing)}")
+                        continue
+                    total_rows += len(frame)
+                    code_ok = frame[company_column].map(fix_stock_code).fillna("").str.strip() != ""
+                    years = parse_year_column(frame[date_column])
+                    months = parse_month_column(frame[date_column])
+                    valid = code_ok & (years > 0)
+                    valid_rows += int(valid.sum())
+                    month_rows += int((valid & (months > 0)).sum())
+                    joined = frame[text_columns].fillna("").astype(str).agg("".join, axis=1)
+                    empty_text += int((valid & (joined.str.strip() == "")).sum())
+                    if Path(path).suffix.lower() in {".xlsx", ".xls"} and len(layout_lines) < 5:
+                        sheet, header_row, confidence = describe_layout(path)
+                        layout_lines.append(
+                            f"{os.path.basename(path)}：工作表“{sheet}”，表头第{header_row + 1}行，置信度{confidence * 100:.0f}%"
+                        )
+                except Exception as exc:
+                    failed.append(f"{os.path.basename(path)}：{exc}")
+
+            valid_rate = valid_rows / total_rows * 100 if total_rows else 0.0
+            month_rate = month_rows / valid_rows * 100 if valid_rows else 0.0
+            summary = (
+                f"抽查文件：{len(sampled_files)} 个（每个最多 500 行）\n"
+                f"抽查行数：{total_rows:,}\n"
+                f"有效记录：{valid_rows:,}（{valid_rate:.1f}%）\n"
+                f"月份识别：{month_rows:,}（有效记录的 {month_rate:.1f}%）\n"
+                f"空文本：{empty_text:,}\n"
+                f"读取/列配置异常：{len(failed)} 个文件"
+            )
+            details = ""
+            if layout_lines:
+                details += "\n\n自动识别的工作表与表头：\n" + "\n".join(layout_lines)
+            if failed:
+                details += "\n\n异常示例：\n" + "\n".join(failed[:8])
+
+            def finish():
+                self.data_quality_hint_var.set(
+                    f"有效率 {valid_rate:.1f}%｜月份识别率 {month_rate:.1f}%｜异常文件 {len(failed)}"
+                )
+                messagebox.showinfo("数据识别质量检查", summary + details)
+
+            self.after(0, finish)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_file_select(self, _event=None):
         sel = self.file_listbox.curselection()
@@ -2773,6 +3300,7 @@ class WordFreqApp(tk.Tk):
             if not messagebox.askyesno("确认", "新建词典将清空当前所有分类和关键词，确定？"):
                 return
         self.dict_mgr.clear()
+        self._last_dictionary_path = ""
         self.cat_listbox.delete(0, tk.END)
         self.word_listbox.delete(0, tk.END)
         self._update_dict_info()
@@ -2791,6 +3319,7 @@ class WordFreqApp(tk.Tk):
             return
         try:
             self.dict_mgr.import_file(path)
+            self._last_dictionary_path = path
             self._refresh_cat_list()
             self.word_listbox.delete(0, tk.END)
             summary = self.dict_mgr.summary_text()
@@ -2799,6 +3328,7 @@ class WordFreqApp(tk.Tk):
                 f"共 {len(self.dict_mgr.categories())} 个分类，"
                 f"{self.dict_mgr.total_word_count()} 个关键词：\n\n{summary}"
             )
+            self._persist_preferences(report_error=False)
         except Exception as e:
             messagebox.showerror("导入失败", str(e))
 
@@ -2927,6 +3457,69 @@ class WordFreqApp(tk.Tk):
         if path:
             self.output_path.set(path)
 
+    def _open_result_location(self):
+        result_path = getattr(self, "_last_result_path", "") or self.output_path.get()
+        if not result_path:
+            messagebox.showwarning("提示", "尚未选择或生成结果文件。")
+            return
+        folder = result_path if os.path.isdir(result_path) else os.path.dirname(result_path)
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("提示", f"结果目录不存在：\n{folder}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as exc:
+            messagebox.showerror("无法打开目录", str(exc))
+
+    def _show_about(self):
+        self._status_var.set("正在检查新版本…")
+
+        def work():
+            try:
+                from wordfreq_app.release import check_latest_release
+
+                result = check_latest_release()
+                if result["update_available"]:
+                    prompt = (
+                        f"{APP_NAME}\n当前版本：v{APP_VERSION}\n"
+                        f"最新版本：v{result['latest']}\n\n"
+                        "发现新版本，是否打开下载页面？"
+                    )
+
+                    def show_update():
+                        self._update_status_bar()
+                        if messagebox.askyesno("发现新版本", prompt):
+                            webbrowser.open(str(result["url"]))
+
+                    self.after(0, show_update)
+                else:
+                    self.after(0, lambda: (
+                        self._update_status_bar(),
+                        messagebox.showinfo(
+                            "关于",
+                            f"{APP_NAME}\n版本：v{APP_VERSION}\n作者：陈浩杰\n"
+                            "澳门城市大学金融学院\n\n当前已是最新正式版本。",
+                        ),
+                    ))
+            except Exception as exc:
+                error = str(exc)
+                self.after(0, lambda: (
+                    self._update_status_bar(),
+                    messagebox.showinfo(
+                        "关于",
+                        f"{APP_NAME}\n版本：v{APP_VERSION}\n作者：陈浩杰\n"
+                        "澳门城市大学金融学院\n\n"
+                        f"暂时无法获取最新版本信息：{error}",
+                    ),
+                ))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ================================================================
     #  日志 / 进度（线程安全）
     # ================================================================
@@ -2982,13 +3575,8 @@ class WordFreqApp(tk.Tk):
             messagebox.showwarning("提示", "请在「数据选择」配置 日期/年份列。")
             return
 
-        # v3.0: 将显示标签还原为真实列名
-        col_map = getattr(self, "_col_display_map", {})
-        selected_text_cols = []
-        for i in self.col_listbox.curselection():
-            label = self.col_listbox.get(i)
-            real_col = col_map.get(label, label)
-            selected_text_cols.append(real_col)
+        selected_text_cols = self._selected_columns_from(self.col_listbox)
+        retained_columns = self._selected_columns_from(self.retain_listbox)
         if not selected_text_cols:
             messagebox.showwarning("提示", "请在「数据选择」选择至少一个文本列。")
             return
@@ -3046,6 +3634,18 @@ class WordFreqApp(tk.Tk):
                 else:
                     messagebox.showwarning("提示", "已勾选自定义缓存路径，但未选择文件位置。")
                     return
+            estimated = (
+                "数量不设上限，费用取决于实际命中句子数"
+                if llm_max_sentences <= 0
+                else f"最多 {llm_max_sentences:,} 句，约 {llm_max_sentences * 200:,}–{llm_max_sentences * 500:,} token"
+            )
+            if not messagebox.askyesno(
+                "外部模型与费用确认",
+                "启用 LLM 后，命中句子、关键词和分类会发送到外部模型服务：\n"
+                f"{llm_base_url}\n\n{estimated}\n\n"
+                "这可能产生 API 费用。确认继续吗？",
+            ):
+                return
 
         # 停用词
         stopwords: set[str] = set()
@@ -3053,6 +3653,8 @@ class WordFreqApp(tk.Tk):
             stopwords = set(DEFAULT_STOPWORDS)
             if self.stopwords_path.get() and os.path.isfile(self.stopwords_path.get()):
                 stopwords |= load_stopwords_file(self.stopwords_path.get())
+
+        self._persist_preferences(report_error=True)
 
         # 锁定 UI
         self._cancel_event.clear()
@@ -3080,7 +3682,8 @@ class WordFreqApp(tk.Tk):
             stopwords=stopwords,
             use_tf=self.var_tf.get(),
             export_sentences=self.var_sentences.get(),
-            preserve_rows=self.var_preserve_rows.get(),
+            aggregation_mode=self.aggregation_mode_var.get(),
+            retained_columns=retained_columns,
             analyze_llm=self.var_llm.get(),
             llm_api_key=llm_api_key,
             llm_model=llm_model,
@@ -3106,7 +3709,22 @@ class WordFreqApp(tk.Tk):
     def _run_thread(self, **kwargs):
         try:
             run_analysis(**kwargs)
-            self.after(0, lambda: messagebox.showinfo("完成", "面板数据词频统计已完成！"))
+            output_path = kwargs["output_path"]
+
+            def finish_success():
+                self._last_result_path = output_path
+                self._recent_outputs = [
+                    output_path,
+                    *[path for path in self._recent_outputs if path != output_path],
+                ][:10]
+                self._persist_preferences(report_error=False)
+                messagebox.showinfo(
+                    "完成",
+                    f"词频统计已完成！\n\n结果：{output_path}\n\n"
+                    "结果文件中已包含数据质量、异常记录、输入清单和运行元数据。",
+                )
+
+            self.after(0, finish_success)
         except Exception as e:
             msg = str(e)
             self._log(f"错误：{msg}")

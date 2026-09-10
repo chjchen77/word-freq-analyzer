@@ -151,7 +151,21 @@ def _parse_args() -> argparse.Namespace:
         "--aggregate-year",
         action="store_true",
         default=False,
-        help="兼容旧模式：按公司代码×年份汇总（默认逐条保留原始记录）",
+        help="兼容旧参数：按公司代码×年份汇总；优先级高于 --aggregation",
+    )
+    p.add_argument(
+        "--aggregation",
+        choices=("raw", "monthly", "yearly"),
+        default="raw",
+        help="统计粒度：raw=逐条、monthly=公司×月份、yearly=公司×年份（默认：raw）",
+    )
+    p.add_argument(
+        "--retain-column",
+        dest="retained_columns",
+        metavar="COL",
+        action="append",
+        default=None,
+        help="逐条模式中保留的原始字段（可重复指定多个）",
     )
     p.add_argument(
         "--use-tf",
@@ -454,7 +468,8 @@ def main() -> int:
             llm_cache_path=llm_cache_path,
             llm_system_prompt=llm_system_prompt,
             analysis_workers=args.workers,
-            preserve_rows=not args.aggregate_year,
+            aggregation_mode="yearly" if args.aggregate_year else args.aggregation,
+            retained_columns=args.retained_columns or [],
             jieba_userdict=args.jieba_userdict,
             log_cb=log_cb,
             cancel_event=cancel_event,

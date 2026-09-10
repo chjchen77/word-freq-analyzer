@@ -29,6 +29,8 @@ jobs:
 
       - name: Build application
         shell: cmd
+        env:
+          CI: 'true'
         run: build_windows.bat
 
       - name: Add Windows instructions

@@ -10,7 +10,7 @@
 #   ./build_app.sh
 #
 # 前置条件：
-#   pip install pyinstaller jieba pandas openpyxl xlrd openai xlsxwriter
+#   pip install -r requirements-build.txt
 # ============================================================
 
 set -e
@@ -23,14 +23,14 @@ echo "  中文文本词频统计分析工具 — 打包开始"
 echo "================================================"
 
 # 检查 PyInstaller
-if ! command -v pyinstaller &> /dev/null; then
+if ! python3 -c 'import PyInstaller' >/dev/null 2>&1; then
     echo "正在安装 PyInstaller..."
-    pip install pyinstaller
+    python3 -m pip install -r requirements-build.txt
 fi
 
 # 检查依赖
 echo "检查依赖..."
-pip install -q -r requirements.txt pyinstaller
+python3 -m pip install -q -r requirements-build.txt
 
 # 清理旧构建
 rm -rf build dist
@@ -39,7 +39,7 @@ rm -f *.spec 2>/dev/null || true
 echo "开始打包..."
 
 # 打包为目录包（onedir）：启动时无需解压，速度远快于 onefile
-pyinstaller \
+python3 -m PyInstaller \
     --onedir \
     --windowed \
     --name "词频统计分析工具" \
@@ -54,6 +54,7 @@ pyinstaller \
     --hidden-import jieba.analyse \
     --collect-data jieba \
     --collect-data openpyxl \
+    --collect-submodules keyring.backends \
     --exclude-module torch \
     --exclude-module tensorflow \
     --exclude-module matplotlib \

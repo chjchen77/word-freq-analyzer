@@ -1,0 +1,9 @@
+# Reproducible runtime used by release builds.
+jieba==0.42.1
+pandas==2.3.2
+openpyxl==3.1.5
+xlrd==2.0.2
+openai==1.109.1
+xlsxwriter==3.2.9
+keyring==25.6.0
+setuptools==80.9.0

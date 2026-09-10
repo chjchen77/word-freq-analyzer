@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import openpyxl
 import pandas as pd
@@ -10,6 +11,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import word_freq_analyzer as analyzer
 from llm_sentence_analyzer import LLMAnalyzerConfig, QwenSentenceAnalyzer
+from wordfreq_app import settings as app_settings
+from wordfreq_app.version import version_tuple
 
 
 class CoreRegressionTests(unittest.TestCase):
@@ -97,7 +100,10 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(sentence_output.exists())
             self.assertEqual(
                 pd.ExcelFile(output).sheet_names,
-                ["原始记录统计", "原始记录关键词", "分类汇总", "词典诊断", "分析说明"],
+                [
+                    "原始记录统计", "原始记录关键词", "分类汇总", "数据质量",
+                    "异常记录", "输入文件清单", "运行元数据", "词典诊断", "分析说明",
+                ],
             )
             panel = pd.read_excel(output, sheet_name="原始记录统计", dtype=str)
             self.assertEqual(set(panel["公司代码"]), {"000001", "000002"})
@@ -113,6 +119,117 @@ class CoreRegressionTests(unittest.TestCase):
             sentences = pd.read_excel(sentence_output, sheet_name="命中句子")
             self.assertEqual(len(sentences), 3)
             self.assertFalse((tmp_path / "result_checkpoint").exists())
+
+    def test_raw_mode_keeps_selected_source_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "source.xlsx"
+            output = tmp_path / "result.xlsx"
+            pd.DataFrame([{
+                "companyid": "1", "公司简称": "甲公司", "调研机构": "乙机构",
+                "日期": "2024-03-01", "内容": "公司推进绿色发展。",
+            }]).to_excel(source, index=False)
+            manager = analyzer.DictionaryManager()
+            manager.add_category("环境")
+            manager.add_word("环境", "绿色发展")
+
+            analyzer.run_analysis(
+                files=[str(source)], dict_mgr=manager,
+                col_stkcd="companyid", col_year="日期", text_columns=["内容"],
+                retained_columns=["公司简称", "调研机构"],
+                output_path=str(output), aggregation_mode="raw",
+            )
+            result = pd.read_excel(output, sheet_name="原始记录统计", dtype=str)
+            self.assertEqual(result.loc[0, "公司简称"], "甲公司")
+            self.assertEqual(result.loc[0, "调研机构"], "乙机构")
+
+    def test_monthly_mode_aggregates_and_reports_unknown_month(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "source.xlsx"
+            output = tmp_path / "result.xlsx"
+            pd.DataFrame([
+                {"code": "1", "日期": "2024-03-01", "内容": "公司持续推进绿色绿色发展工作。"},
+                {"code": "1", "日期": "2024-03-20", "内容": "公司持续推进绿色发展工作。"},
+                {"code": "1", "日期": "2024-04-01", "内容": "公司持续推进绿色发展工作。"},
+                {"code": "1", "日期": "2024年", "内容": "公司持续推进绿色发展工作。"},
+            ]).to_excel(source, index=False)
+            manager = analyzer.DictionaryManager()
+            manager.add_category("环境")
+            manager.add_word("环境", "绿色")
+
+            analyzer.run_analysis(
+                files=[str(source)], dict_mgr=manager,
+                col_stkcd="code", col_year="日期", text_columns=["内容"],
+                output_path=str(output), aggregation_mode="monthly",
+            )
+            result = pd.read_excel(output, sheet_name="公司月份分类统计")
+            self.assertEqual(result["月份"].tolist(), [3, 4])
+            self.assertEqual(result["环境"].tolist(), [3, 1])
+            quality = pd.read_excel(output, sheet_name="数据质量")
+            total = quality.iloc[-1]
+            self.assertEqual(int(total["有效记录数"]), 4)
+            self.assertEqual(int(total["进入统计记录数"]), 3)
+            self.assertEqual(int(total["月份无法识别"]), 1)
+
+    def test_excel_layout_detects_nonfirst_sheet_and_header_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "layout.xlsx"
+            workbook = openpyxl.Workbook()
+            notes = workbook.active
+            notes.title = "说明"
+            notes.append(["本文件为调研数据说明"])
+            data = workbook.create_sheet("数据")
+            data.append(["调研数据汇总表"])
+            data.append([])
+            data.append(["companyid", "日期", "调研报告内容"])
+            data.append(["1", "2024-05-01", "绿色发展"])
+            workbook.save(path)
+            workbook.close()
+
+            self.assertEqual(
+                analyzer._read_columns_fast(str(path)),
+                ["companyid", "日期", "调研报告内容"],
+            )
+            frame = analyzer.read_data_file(str(path), nrows=10)
+            self.assertEqual(frame.iloc[0]["调研报告内容"], "绿色发展")
+
+    def test_quality_report_records_invalid_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "source.xlsx"
+            output = tmp_path / "result.xlsx"
+            pd.DataFrame([
+                {"code": "", "日期": "2024-01-01", "内容": "绿色"},
+                {"code": "1", "日期": "无法识别", "内容": "绿色"},
+                {"code": "2", "日期": "2024-03-01", "内容": ""},
+            ]).to_excel(source, index=False)
+            manager = analyzer.DictionaryManager()
+            manager.add_category("环境")
+            manager.add_word("环境", "绿色")
+            analyzer.run_analysis(
+                files=[str(source)], dict_mgr=manager,
+                col_stkcd="code", col_year="日期", text_columns=["内容"],
+                output_path=str(output), aggregation_mode="raw",
+            )
+            quality = pd.read_excel(output, sheet_name="数据质量").iloc[-1]
+            self.assertEqual(int(quality["公司代码为空"]), 1)
+            self.assertEqual(int(quality["年份无法识别"]), 1)
+            self.assertEqual(int(quality["文本为空"]), 1)
+            issues = pd.read_excel(output, sheet_name="异常记录")
+            self.assertEqual(set(issues["问题类型"]), {"公司代码为空", "年份无法识别", "文本为空"})
+
+    def test_settings_never_write_api_key_to_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with patch.object(app_settings, "settings_path", return_value=path):
+                app_settings.save_settings({"api_key": "secret", "aggregation_mode": "raw"})
+                raw = path.read_text(encoding="utf-8")
+                self.assertNotIn("secret", raw)
+                self.assertEqual(app_settings.load_settings()["aggregation_mode"], "raw")
+
+    def test_version_tuple_handles_release_tags(self):
+        self.assertGreater(version_tuple("v4.2.0"), version_tuple("4.1"))
 
     def test_llm_partial_json_is_not_reported_as_success(self):
         model = QwenSentenceAnalyzer(LLMAnalyzerConfig.from_inputs(api_key="test-key"))

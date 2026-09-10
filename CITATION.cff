@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "中文文本词频统计分析工具"
+version: 4.2.0
+date-released: 2026-09-10
+authors:
+  - family-names: "陈"
+    given-names: "浩杰"
+    affiliation: "澳门城市大学金融学院"
+repository-code: "https://github.com/chjchen77/word-freq-analyzer"
+license: MIT
+abstract: "用于中文文本分类词典匹配、词频统计、年月识别与可复核结果导出的桌面工具。"
