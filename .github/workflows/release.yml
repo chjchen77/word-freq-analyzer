@@ -113,7 +113,10 @@ jobs:
 
       - name: Generate checksums
         shell: bash
-        run: sha256sum release-files/* > release-files/SHA256SUMS.txt
+        run: |
+          find release-files -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > release-files/SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:
@@ -125,5 +128,7 @@ jobs:
               --title "中文文本词频统计分析工具 ${{ env.RELEASE_TAG }}" \
               --generate-notes
           fi
-          gh release upload "${{ env.RELEASE_TAG }}" release-files/* \
-            --repo "${{ github.repository }}" --clobber
+          while IFS= read -r -d '' file; do
+            gh release upload "${{ env.RELEASE_TAG }}" "$file" \
+              --repo "${{ github.repository }}" --clobber
+          done < <(find release-files -type f -print0)
