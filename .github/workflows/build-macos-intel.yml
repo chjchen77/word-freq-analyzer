@@ -1,0 +1,47 @@
+name: Build macOS Intel application
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or commit to package'
+        required: true
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    # macos-13 is GitHub's Intel hosted macOS image. The resulting package
+    # targets x86_64 Macs such as the 2017 MacBook Pro running Ventura.
+    runs-on: macos-13
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Build Intel macOS application
+        run: ./build_app.sh
+
+      - name: Create Intel macOS ZIP
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            'dist/词频统计分析工具.app' \
+            '词频统计工具-macOS-Intel-x86_64.zip'
+
+      - name: Upload Intel macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-package
+          path: 词频统计工具-macOS-Intel-x86_64.zip
+          if-no-files-found: error
