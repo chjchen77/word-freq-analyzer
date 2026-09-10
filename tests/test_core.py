@@ -98,13 +98,14 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(output.exists())
             sentence_output = tmp_path / "result_sentences.xlsx"
             self.assertTrue(sentence_output.exists())
-            self.assertEqual(
-                pd.ExcelFile(output).sheet_names,
-                [
-                    "原始记录统计", "原始记录关键词", "分类汇总", "数据质量",
-                    "异常记录", "输入文件清单", "运行元数据", "词典诊断", "分析说明",
-                ],
-            )
+            with pd.ExcelFile(output) as workbook:
+                self.assertEqual(
+                    workbook.sheet_names,
+                    [
+                        "原始记录统计", "原始记录关键词", "分类汇总", "数据质量",
+                        "异常记录", "输入文件清单", "运行元数据", "词典诊断", "分析说明",
+                    ],
+                )
             panel = pd.read_excel(output, sheet_name="原始记录统计", dtype=str)
             self.assertEqual(set(panel["公司代码"]), {"000001", "000002"})
             self.assertEqual(len(panel), 3)
