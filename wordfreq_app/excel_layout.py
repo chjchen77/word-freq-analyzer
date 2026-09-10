@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import posixpath
+import zipfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
+from xml.etree import ElementTree as ET
 
 HEADER_SCAN_ROWS = 20
 HEADER_HINTS = (
@@ -66,33 +69,178 @@ def choose_header_row(rows: Iterable[Iterable[Any]]) -> tuple[int, float]:
     return best_index, round(confidence, 3)
 
 
-@lru_cache(maxsize=512)
-def _detect_xlsx_cached(path: str, size: int, mtime_ns: int) -> tuple[str, int, float]:
-    del size, mtime_ns
-    from openpyxl import load_workbook
+_SHARED_STRING_REF = object()
 
-    workbook = load_workbook(path, read_only=True, data_only=True)
+
+def _xml_name(value: str) -> str:
+    """Return an XML tag/attribute name without its namespace."""
+    return value.rsplit("}", 1)[-1]
+
+
+def _cell_column_index(reference: str) -> int:
+    """Return a zero-based column index from an XLSX cell reference."""
+    result = 0
+    for character in reference:
+        if not character.isalpha():
+            break
+        result = result * 26 + (ord(character.upper()) - ord("A") + 1)
+    return max(0, result - 1)
+
+
+def _cell_value(cell: ET.Element) -> Any:
+    """Extract a value from a worksheet cell without loading openpyxl."""
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        return "".join(
+            part.text or "" for part in cell.iter() if _xml_name(part.tag) == "t"
+        )
+
+    raw_value = ""
+    for child in cell:
+        if _xml_name(child.tag) == "v":
+            raw_value = child.text or ""
+            break
+    if cell_type == "s":
+        try:
+            return (_SHARED_STRING_REF, int(raw_value))
+        except ValueError:
+            return None
+    return raw_value or None
+
+
+def _read_xlsx_rows(archive: zipfile.ZipFile, sheet_path: str) -> list[list[Any]]:
+    """Read only the first header-scan rows from a worksheet XML stream."""
+    rows: dict[int, list[Any]] = {}
+    max_row = HEADER_SCAN_ROWS + 1
+    with archive.open(sheet_path) as stream:
+        for _event, element in ET.iterparse(stream, events=("end",)):
+            if _xml_name(element.tag) != "row":
+                continue
+            try:
+                row_number = int(element.attrib.get("r", "0"))
+            except ValueError:
+                row_number = 0
+            if row_number <= 0:
+                row_number = len(rows) + 1
+            if row_number > max_row:
+                element.clear()
+                break
+
+            values_by_column: dict[int, Any] = {}
+            for cell in element:
+                if _xml_name(cell.tag) != "c":
+                    continue
+                column_index = _cell_column_index(cell.attrib.get("r", "A1"))
+                values_by_column[column_index] = _cell_value(cell)
+            if values_by_column:
+                values = [None] * (max(values_by_column) + 1)
+                for column_index, value in values_by_column.items():
+                    values[column_index] = value
+                rows[row_number] = values
+            element.clear()
+
+    return [rows.get(index, []) for index in range(1, max_row + 1)]
+
+
+def _resolve_shared_strings(
+    archive: zipfile.ZipFile, rows: list[list[Any]],
+) -> list[list[Any]]:
+    """Resolve only the shared-string indexes present in the scanned rows."""
+    needed = {
+        value[1]
+        for row in rows
+        for value in row
+        if isinstance(value, tuple) and len(value) == 2 and value[0] is _SHARED_STRING_REF
+    }
+    if not needed:
+        return rows
+
     try:
-        candidates: list[tuple[float, int, str, int]] = []
-        for sheet_index, worksheet in enumerate(workbook.worksheets):
-            rows = list(worksheet.iter_rows(
-                min_row=1, max_row=HEADER_SCAN_ROWS + 1, values_only=True,
-            ))
+        stream = archive.open("xl/sharedStrings.xml")
+    except KeyError:
+        return rows
+
+    resolved: dict[int, str] = {}
+    max_needed = max(needed)
+    with stream:
+        index = 0
+        for _event, element in ET.iterparse(stream, events=("end",)):
+            if _xml_name(element.tag) != "si":
+                continue
+            if index in needed:
+                resolved[index] = "".join(element.itertext())
+            index += 1
+            element.clear()
+            if index > max_needed and needed.issubset(resolved):
+                break
+
+    return [
+        [
+            resolved.get(value[1]) if isinstance(value, tuple) and len(value) == 2
+            and value[0] is _SHARED_STRING_REF else value
+            for value in row
+        ]
+        for row in rows
+    ]
+
+
+def _xlsx_sheets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
+    """Return (sheet name, worksheet XML path) pairs from an XLSX archive."""
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    targets = {
+        relationship.attrib.get("Id", ""): relationship.attrib.get("Target", "")
+        for relationship in relationships
+        if _xml_name(relationship.tag) == "Relationship"
+    }
+    sheets: list[tuple[str, str]] = []
+    for sheet in workbook.iter():
+        if _xml_name(sheet.tag) != "sheet":
+            continue
+        relationship_id = next(
+            (value for key, value in sheet.attrib.items() if _xml_name(key) == "id"), ""
+        )
+        target = targets.get(relationship_id, "").lstrip("/")
+        if target and not target.startswith("xl/"):
+            target = posixpath.normpath(posixpath.join("xl", target))
+        if target:
+            sheets.append((sheet.attrib.get("name", ""), target))
+    return sheets
+
+
+@lru_cache(maxsize=512)
+def _inspect_xlsx_cached(
+    path: str, size: int, mtime_ns: int,
+) -> tuple[str, int, float, tuple[Any, ...]]:
+    """Inspect an XLSX header without materialising its whole shared-string table."""
+    del size, mtime_ns
+    with zipfile.ZipFile(path) as archive:
+        candidates: list[tuple[float, int, str, int, tuple[Any, ...]]] = []
+        for sheet_name, sheet_path in _xlsx_sheets(archive):
+            rows = _resolve_shared_strings(archive, _read_xlsx_rows(archive, sheet_path))
             header_row, confidence = choose_header_row(rows)
-            nonempty = sum(bool(_clean(value)) for value in rows[header_row]) if rows else 0
-            candidates.append((confidence, nonempty, worksheet.title, header_row))
+            header = tuple(rows[header_row]) if header_row < len(rows) else ()
+            nonempty = sum(bool(_clean(value)) for value in header)
+            candidates.append((confidence, nonempty, sheet_name, header_row, header))
         if not candidates:
-            return "", 0, 0.0
+            return "", 0, 0.0, ()
         candidates.sort(key=lambda item: (-item[0], -item[1]))
-        confidence, _, sheet_name, header_row = candidates[0]
-        return sheet_name, header_row, confidence
-    finally:
-        workbook.close()
+        confidence, _nonempty, sheet_name, header_row, header = candidates[0]
+        return sheet_name, header_row, confidence, header
+
+
+def xlsx_layout_and_header(path: str) -> tuple[str, int, float, list[Any]]:
+    """Return the likely data sheet, zero-based header row, confidence, and values."""
+    stat = os.stat(path)
+    sheet, header_row, confidence, header = _inspect_xlsx_cached(
+        os.path.abspath(path), stat.st_size, stat.st_mtime_ns,
+    )
+    return sheet, header_row, confidence, list(header)
 
 
 def detect_xlsx_layout(path: str) -> tuple[str, int, float]:
-    stat = os.stat(path)
-    return _detect_xlsx_cached(os.path.abspath(path), stat.st_size, stat.st_mtime_ns)
+    sheet, header_row, confidence, _header = xlsx_layout_and_header(path)
+    return sheet, header_row, confidence
 
 
 def detect_xls_layout(path: str) -> tuple[str | int, int, float]:

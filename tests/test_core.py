@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -194,6 +195,31 @@ class CoreRegressionTests(unittest.TestCase):
             )
             frame = analyzer.read_data_file(str(path), nrows=10)
             self.assertEqual(frame.iloc[0]["调研报告内容"], "绿色发展")
+
+    def test_shared_string_xlsx_headers_and_scan_progress_are_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared_strings.xlsx"
+            import xlsxwriter
+
+            workbook = xlsxwriter.Workbook(path)
+            sheet = workbook.add_worksheet("数据")
+            sheet.write_row(0, 0, ["股票代码", "提问时间", "提问内容"])
+            sheet.write_row(1, 0, ["000001", "2024-03-01", "绿色发展"])
+            workbook.close()
+
+            with zipfile.ZipFile(path) as archive:
+                self.assertIn("xl/sharedStrings.xml", archive.namelist())
+            self.assertEqual(
+                analyzer._read_columns_fast(str(path)),
+                ["股票代码", "提问时间", "提问内容"],
+            )
+            progress = []
+            columns, frequency = analyzer.scan_all_columns(
+                [str(path)], lambda done, total: progress.append((done, total)),
+            )
+            self.assertEqual(columns, ["股票代码", "提问时间", "提问内容"])
+            self.assertEqual(frequency["股票代码"], 1)
+            self.assertEqual(progress, [(1, 1)])
 
     def test_quality_report_records_invalid_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

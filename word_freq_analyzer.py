@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-中文文本词频统计分析工具 v4.2.0
+中文文本词频统计分析工具 v4.2.1
 ==============================
 科研级中文文本词频统计。默认逐条保留原始记录，并从日期中识别年份和月份。
 支持分类词典管理、正则/jieba 双模式、命中句子导出。
@@ -98,7 +98,12 @@ from pathlib import Path
 
 import pandas as pd
 from wordfreq_app import APP_NAME, APP_VERSION, GITHUB_REPOSITORY
-from wordfreq_app.excel_layout import describe_layout, detect_xls_layout, detect_xlsx_layout
+from wordfreq_app.excel_layout import (
+    describe_layout,
+    detect_xls_layout,
+    detect_xlsx_layout,
+    xlsx_layout_and_header,
+)
 from wordfreq_app.quality import (
     dictionary_sha256,
     empty_quality_stats,
@@ -584,33 +589,18 @@ def read_csv_chunked(filepath: str, chunksize: int = CHUNK_ROWS):
 def _read_columns_fast(filepath: str) -> list[str]:
     """
     快速读取文件列名（不加载数据）。
-    v3.0: 对大 xlsx 使用 openpyxl read_only 模式，只读第一行；
-    CSV 只读第一行。比 pd.read_excel(nrows=0) 快 10-100x。
+    对大 xlsx 直接读取压缩包中的前 21 行和必要表头文本，不加载整份
+    sharedStrings.xml；CSV 只读第一行。避免问答等大工作簿在列扫描阶段卡住。
     """
     ext = Path(filepath).suffix.lower()
     if ext == ".txt":
         return ["公司代码", "年份", "文本内容"]
     if ext in (".xlsx", ".xls"):
-        # 优先用 openpyxl 快速读取第一行
+        # XLSX: 只解析工作表 XML 的前 21 行，避免 openpyxl 读取数百万条正文。
         if ext == ".xlsx":
             try:
-                from openpyxl import load_workbook
-                sheet_name, header_row, _confidence = detect_xlsx_layout(filepath)
-                wb = load_workbook(filepath, read_only=True, data_only=True)
-                ws = wb[sheet_name] if sheet_name in wb.sheetnames else (
-                    wb.worksheets[0] if wb.worksheets else None
-                )
-                if ws is None:
-                    wb.close()
-                    return []
-                for row in ws.iter_rows(
-                    min_row=header_row + 1, max_row=header_row + 1, values_only=True,
-                ):
-                    cols = _normalize_column_names(row)
-                    wb.close()
-                    return cols
-                wb.close()
-                return []
+                _sheet, _header_row, _confidence, raw_header = xlsx_layout_and_header(filepath)
+                return _normalize_column_names(raw_header)
             except Exception:
                 pass
         # 回退到 pandas（较慢但更兼容）
@@ -637,7 +627,9 @@ def _read_columns_fast(filepath: str) -> list[str]:
     return []
 
 
-def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
+def scan_all_columns(
+    files: list[str], progress_callback=None,
+) -> tuple[list[str], dict[str, int]]:
     """
     扫描所有文件的列名（只读表头，不加载数据）。
     v3.0: 返回 (列名列表按出现频率降序, 列名→出现文件数)。
@@ -646,7 +638,8 @@ def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
     不因文件体积跳过表头扫描；否则单个大 Excel 会被误报为“发现 0 个数据列”。
     """
     col_freq: dict[str, int] = {}
-    for f in files:
+    total_files = len(files)
+    for index, f in enumerate(files, start=1):
         try:
             ext = Path(f).suffix.lower()
             if ext == ".txt":
@@ -657,7 +650,10 @@ def scan_all_columns(files: list[str]) -> tuple[list[str], dict[str, int]]:
             for c in columns:
                 col_freq[c] = col_freq.get(c, 0) + 1
         except Exception:
-            continue
+            pass
+        finally:
+            if progress_callback is not None:
+                progress_callback(index, total_files)
     # 按频率降序排列
     sorted_cols = sorted(col_freq.keys(), key=lambda x: -col_freq[x])
     return sorted_cols, col_freq
@@ -2917,20 +2913,47 @@ class WordFreqApp(tk.Tk):
             messagebox.showinfo("提示", f"未找到 .xlsx / .xls / .csv / .txt 文件。{err_msg}")
             return
 
+        # 立即显示第一个文件的列，避免大文件夹的后台汇总期间右侧看似空白。
+        self.file_listbox.selection_set(0)
+        self.file_listbox.activate(0)
+        try:
+            first_columns = _read_columns_fast(self.scanned_files[0])
+        except Exception:
+            first_columns = []
+        if first_columns:
+            self._finish_scan(
+                first_columns,
+                {column: 1 for column in first_columns},
+                dir_counts,
+                errors,
+                show_dialog=False,
+            )
+
         # v3.0: 后台线程扫描列名（大 xlsx 读取慢，避免冻结 UI）
         self._status_var.set(f"正在扫描 {len(self.scanned_files)} 个文件的列名…")
+        self.data_quality_hint_var.set(
+            f"已识别首个文件的 {len(first_columns)} 列，正在汇总全部文件（0/{len(self.scanned_files)}）…"
+        )
         self.update_idletasks()
 
         scan_dir_counts = dir_counts
         scan_errors = errors
 
         def _do_scan():
-            cols, freq = scan_all_columns(self.scanned_files)
+            def report_progress(done, total):
+                self.after(
+                    0,
+                    lambda: self.data_quality_hint_var.set(
+                        f"正在汇总全部文件的列（{done}/{total}）…"
+                    ),
+                )
+
+            cols, freq = scan_all_columns(self.scanned_files, report_progress)
             self.after(0, lambda: self._finish_scan(cols, freq, scan_dir_counts, scan_errors))
 
         threading.Thread(target=_do_scan, daemon=True).start()
 
-    def _finish_scan(self, cols, freq, dir_counts, errors):
+    def _finish_scan(self, cols, freq, dir_counts, errors, show_dialog=True):
         """列名扫描完成后在主线程更新 UI。"""
         self.all_columns = cols
         self._col_freq = freq
@@ -3051,14 +3074,19 @@ class WordFreqApp(tk.Tk):
         if auto_info:
             auto_info = f"\n\n自动检测的列配置：{auto_info}\n（请核实是否正确）"
 
-        messagebox.showinfo(
-            "扫描完成",
-            f"共扫描到 {len(self.scanned_files)} 个数据文件，\n"
-            f"分布在 {len(dir_counts)} 个目录中：\n{dir_info}\n\n"
-            f"发现 {len(self.all_columns)} 个数据列。{auto_info}{err_info}"
-        )
-        self.data_quality_hint_var.set("列已识别；建议点击“检查识别质量”后再运行")
-        self._persist_preferences(report_error=False)
+        if show_dialog:
+            messagebox.showinfo(
+                "扫描完成",
+                f"共扫描到 {len(self.scanned_files)} 个数据文件，\n"
+                f"分布在 {len(dir_counts)} 个目录中：\n{dir_info}\n\n"
+                f"发现 {len(self.all_columns)} 个数据列。{auto_info}{err_info}"
+            )
+            self.data_quality_hint_var.set("列已识别；建议点击“检查识别质量”后再运行")
+            self._persist_preferences(report_error=False)
+        else:
+            self.data_quality_hint_var.set(
+                f"已从首个文件识别 {len(self.all_columns)} 列，正在汇总全部文件…"
+            )
 
     def _preview_input_quality(self):
         if not self.scanned_files:

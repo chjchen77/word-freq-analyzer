@@ -1,7 +1,7 @@
 """Single source of truth for release metadata."""
 
 APP_NAME = "中文文本词频统计分析工具"
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.2.1"
 GITHUB_REPOSITORY = "chjchen77/word-freq-analyzer"
 
 
